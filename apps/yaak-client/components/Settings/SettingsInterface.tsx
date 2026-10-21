@@ -174,6 +174,22 @@ export function SettingsInterface() {
           />
         </SettingsSection>
 
+        <SettingsSection title="Tabs">
+          <ModelSettingRowBoolean
+            model={settings}
+            modelKey="requestTabsEnabled"
+            title="Enable request tabs"
+            description="Open multiple requests as tabs above the request editor."
+          />
+          <ModelSettingRowBoolean
+            model={settings}
+            modelKey="requestTabsRestore"
+            title="Restore tabs on startup"
+            description="Reopen the tabs from your previous session instead of starting fresh."
+            disabled={!settings.requestTabsEnabled}
+          />
+        </SettingsSection>
+
         <SettingsSection title="Window">
           <NativeTitlebarSetting settings={settings} />
           {platform.osType() !== "macos" && (

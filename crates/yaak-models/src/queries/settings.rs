@@ -55,6 +55,8 @@ fn default_settings() -> Settings {
         hide_license_badge: false,
         prompt_feedback: true,
         mcp_server_enabled: false,
+        request_tabs_enabled: false,
+        request_tabs_restore: false,
         auto_download_updates: true,
         check_notifications: true,
         hotkeys: HashMap::new(),

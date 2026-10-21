@@ -24,6 +24,7 @@ import { useHotKey } from "../hooks/useHotKey";
 import { useSubscribeRecentCookieJars } from "../hooks/useRecentCookieJars";
 import { useSubscribeRecentEnvironments } from "../hooks/useRecentEnvironments";
 import { useSubscribeRecentRequests } from "../hooks/useRecentRequests";
+import { useSubscribeRequestTabs } from "../hooks/useRequestTabs";
 import { useSubscribeRecentWorkspaces } from "../hooks/useRecentWorkspaces";
 import { useSidebarHidden } from "../hooks/useSidebarHidden";
 import { useSidebarWidth } from "../hooks/useSidebarWidth";
@@ -41,12 +42,20 @@ import { FolderLayout } from "./FolderLayout";
 import { GrpcConnectionLayout } from "./GrpcConnectionLayout";
 import { HttpRequestLayout } from "./HttpRequestLayout";
 import { RedirectToLatestWorkspace } from "./RedirectToLatestWorkspace";
+import { RequestTabs } from "./RequestTabs";
 import Sidebar from "./Sidebar";
 import { SidebarActions } from "./SidebarActions";
 import { WebsocketRequestLayout } from "./WebsocketRequestLayout";
 import { WorkspaceHeader } from "./WorkspaceHeader";
 
 const body = { gridArea: "body" };
+const tabsArea = { gridArea: "tabs" };
+const withTabsGrid = {
+  gridTemplate: `
+    '${tabsArea.gridArea}' auto
+    '${body.gridArea}' minmax(0,1fr)
+    / minmax(0,1fr)`,
+};
 
 export function Workspace() {
   // First, subscribe to some things applicable to workspaces
@@ -92,7 +101,19 @@ export function Workspace() {
     </HeaderSize>
   );
 
-  const workspaceBody = (
+  const workspaceBody = settings.requestTabsEnabled ? (
+    // The layouts below place themselves with `gridArea: body`, so the area has to exist here
+    <div className="grid h-full min-w-0" style={withTabsGrid}>
+      <div style={tabsArea} className="min-w-0">
+        <ErrorBoundary name="Request Tabs">
+          <RequestTabs />
+        </ErrorBoundary>
+      </div>
+      <ErrorBoundary name="Workspace Body">
+        <WorkspaceBody />
+      </ErrorBoundary>
+    </div>
+  ) : (
     <ErrorBoundary name="Workspace Body">
       <WorkspaceBody />
     </ErrorBoundary>
@@ -211,6 +232,7 @@ function useGlobalWorkspaceHooks() {
   useSubscribeActiveCookieJarId();
 
   useSubscribeRecentRequests();
+  useSubscribeRequestTabs();
   useSubscribeRecentWorkspaces();
   useSubscribeRecentEnvironments();
   useSubscribeRecentCookieJars();

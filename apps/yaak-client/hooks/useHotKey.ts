@@ -22,6 +22,7 @@ export type HotkeyAction =
   | "model.duplicate"
   | "request.send"
   | "request.rename"
+  | "request_tab.close"
   | "switcher.next"
   | "switcher.prev"
   | "switcher.toggle"
@@ -62,6 +63,7 @@ const defaultHotkeysMac: Record<HotkeyAction, string[]> = {
   "sidebar.selected.delete": ["Delete", "Meta+Backspace"],
   "sidebar.selected.duplicate": ["Meta+d"],
   "sidebar.selected.move": [],
+  "request_tab.close": [],
   "sidebar.selected.rename": ["Enter"],
   "sidebar.focus": ["Meta+b"],
   "sidebar.context_menu": ["Control+Enter"],
@@ -93,6 +95,7 @@ const defaultHotkeysOther: Record<HotkeyAction, string[]> = {
   "sidebar.selected.delete": ["Delete", "Control+Backspace"],
   "sidebar.selected.duplicate": ["Control+d"],
   "sidebar.selected.move": [],
+  "request_tab.close": [],
   "sidebar.selected.rename": ["Enter"],
   "sidebar.focus": ["Control+b"],
   "sidebar.context_menu": ["Alt+Insert"],
@@ -142,6 +145,7 @@ const hotkeyLabels: Record<HotkeyAction, string> = {
   "model.duplicate": "Duplicate Request",
   "request.rename": "Rename Active Request",
   "request.send": "Send Active Request",
+  "request_tab.close": "Close Active Request Tab",
   "switcher.next": "Go To Previous Request",
   "switcher.prev": "Go To Next Request",
   "switcher.toggle": "Toggle Request Switcher",
