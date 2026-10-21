@@ -482,7 +482,7 @@ export type Icon = "alert_triangle" | "check" | "check_circle" | "chevron_down" 
  */
 export type ImportFileSource = { "type": "file", name: string, base64: string, } | { "type": "directory", path: string, };
 
-export type ImportRequest = {
+export type ImportRequest = { 
 /**
  * Kept for text-only importers and older runtimes.
  */
@@ -588,7 +588,7 @@ export type RenderHttpRequestResponse = { httpRequest: HttpRequest, };
 
 export type RenderPurpose = "send" | "preview";
 
-export type SendHttpRequestRequest = { httpRequest: Partial<HttpRequest>,
+export type SendHttpRequestRequest = { httpRequest: Partial<HttpRequest>, 
 /**
  * Override the environment for this send without changing the active selection.
  * When omitted, use the host's active environment.
