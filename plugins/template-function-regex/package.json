@@ -1,0 +1,12 @@
+{
+  "name": "@yaak/template-function-regex",
+  "displayName": "Regex Template Functions",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Template functions for working with regular expressions",
+  "scripts": {
+    "build": "yaakcli build",
+    "dev": "yaakcli dev",
+    "test": "vp test --run tests"
+  }
+}

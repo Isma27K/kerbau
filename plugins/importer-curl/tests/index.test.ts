@@ -1,0 +1,1026 @@
+import type { HttpRequest, Workspace } from "@yaakapp/api";
+import { describe, expect, test } from "vite-plus/test";
+import { convertCurl } from "../src";
+
+describe("importer-curl", () => {
+  test("Imports basic GET", () => {
+    expect(convertCurl("curl https://yaak.app")).toEqual({
+      resources: {
+        workspaces: [baseWorkspace()],
+        httpRequests: [
+          baseRequest({
+            url: "https://yaak.app",
+          }),
+        ],
+      },
+    });
+  });
+
+  // A short cluster is one option per character until one that takes a value.
+  // `-fsSL` is four boolean flags, so nothing in it is a positional argument --
+  // the URL used to come out as "sSL".
+  test("Imports combined short flags", () => {
+    expect(convertCurl("curl -fsSL https://yaak.app")).toEqual({
+      resources: {
+        workspaces: [baseWorkspace()],
+        httpRequests: [
+          baseRequest({
+            url: "https://yaak.app",
+          }),
+        ],
+      },
+    });
+  });
+
+  test("Imports a combined short cluster ending in a value flag", () => {
+    expect(convertCurl("curl -sSXPOST https://yaak.app")).toEqual({
+      resources: {
+        workspaces: [baseWorkspace()],
+        httpRequests: [
+          baseRequest({
+            url: "https://yaak.app",
+            method: "POST",
+          }),
+        ],
+      },
+    });
+  });
+
+  test("Explicit URL", () => {
+    expect(convertCurl("curl --url https://yaak.app")).toEqual({
+      resources: {
+        workspaces: [baseWorkspace()],
+        httpRequests: [
+          baseRequest({
+            url: "https://yaak.app",
+          }),
+        ],
+      },
+    });
+  });
+
+  test("Missing URL", () => {
+    expect(convertCurl("curl -X POST")).toEqual({
+      resources: {
+        workspaces: [baseWorkspace()],
+        httpRequests: [
+          baseRequest({
+            method: "POST",
+          }),
+        ],
+      },
+    });
+  });
+
+  test("URL between", () => {
+    expect(convertCurl("curl -v https://yaak.app -X POST")).toEqual({
+      resources: {
+        workspaces: [baseWorkspace()],
+        httpRequests: [
+          baseRequest({
+            url: "https://yaak.app",
+            method: "POST",
+          }),
+        ],
+      },
+    });
+  });
+
+  test("Random flags", () => {
+    expect(convertCurl("curl --random -Z -Y -S --foo https://yaak.app")).toEqual({
+      resources: {
+        workspaces: [baseWorkspace()],
+        httpRequests: [
+          baseRequest({
+            url: "https://yaak.app",
+          }),
+        ],
+      },
+    });
+  });
+
+  test("Imports --request method", () => {
+    expect(convertCurl("curl --request POST https://yaak.app")).toEqual({
+      resources: {
+        workspaces: [baseWorkspace()],
+        httpRequests: [
+          baseRequest({
+            url: "https://yaak.app",
+            method: "POST",
+          }),
+        ],
+      },
+    });
+  });
+
+  test("Imports -XPOST method", () => {
+    expect(convertCurl("curl -XPOST --request POST https://yaak.app")).toEqual({
+      resources: {
+        workspaces: [baseWorkspace()],
+        httpRequests: [
+          baseRequest({
+            url: "https://yaak.app",
+            method: "POST",
+          }),
+        ],
+      },
+    });
+  });
+
+  test("Imports multiple requests", () => {
+    expect(
+      convertCurl('curl \\\n  https://yaak.app\necho "foo"\ncurl example.com;curl foo.com'),
+    ).toEqual({
+      resources: {
+        workspaces: [baseWorkspace()],
+        httpRequests: [
+          baseRequest({ url: "https://yaak.app" }),
+          baseRequest({ url: "example.com" }),
+          baseRequest({ url: "foo.com" }),
+        ],
+      },
+    });
+  });
+
+  // A trailing space after the continuation backslash is invisible in most
+  // editors but used to stop the join, so the quoted body split across
+  // lines and the parser failed with "Got EOF while in a quoted string".
+  test("Imports line continuations with trailing whitespace after the backslash", () => {
+    expect(
+      convertCurl(
+        "curl -X POST https://yaak.app \\ \n  -H 'Content-Type: application/json' \\\t\n  --data '{\"a\":1}' \\ \r\n  -H 'Accept: application/json'",
+      ),
+    ).toEqual({
+      resources: {
+        workspaces: [baseWorkspace()],
+        httpRequests: [
+          baseRequest({
+            url: "https://yaak.app",
+            method: "POST",
+            headers: [
+              { name: "Content-Type", value: "application/json", enabled: true },
+              { name: "Accept", value: "application/json", enabled: true },
+            ],
+            bodyType: "application/json",
+            body: { text: '{"a":1}' },
+          }),
+        ],
+      },
+    });
+  });
+
+  test("Imports with Windows CRLF line endings", () => {
+    expect(convertCurl("curl \\\r\n  -X POST \\\r\n  https://yaak.app")).toEqual({
+      resources: {
+        workspaces: [baseWorkspace()],
+        httpRequests: [baseRequest({ url: "https://yaak.app", method: "POST" })],
+      },
+    });
+  });
+
+  test("Throws on malformed quotes", () => {
+    expect(() => convertCurl('curl -X POST -F "a=aaa" -F b=bbb" https://yaak.app')).toThrow();
+  });
+
+  test("Imports form data", () => {
+    expect(convertCurl('curl -X POST -F "a=aaa" -F b=bbb -F f=@filepath https://yaak.app')).toEqual(
+      {
+        resources: {
+          workspaces: [baseWorkspace()],
+          httpRequests: [
+            baseRequest({
+              method: "POST",
+              url: "https://yaak.app",
+              headers: [
+                {
+                  name: "Content-Type",
+                  value: "multipart/form-data",
+                  enabled: true,
+                },
+              ],
+              bodyType: "multipart/form-data",
+              body: {
+                form: [
+                  { enabled: true, name: "a", value: "aaa" },
+                  { enabled: true, name: "b", value: "bbb" },
+                  { enabled: true, name: "f", file: "filepath" },
+                ],
+              },
+            }),
+          ],
+        },
+      },
+    );
+  });
+
+  test("Imports data params as form url-encoded", () => {
+    expect(convertCurl("curl -d a -d b -d c=ccc https://yaak.app")).toEqual({
+      resources: {
+        workspaces: [baseWorkspace()],
+        httpRequests: [
+          baseRequest({
+            method: "POST",
+            url: "https://yaak.app",
+            bodyType: "application/x-www-form-urlencoded",
+            headers: [
+              {
+                name: "Content-Type",
+                value: "application/x-www-form-urlencoded",
+                enabled: true,
+              },
+            ],
+            body: {
+              form: [
+                { name: "a", value: "", enabled: true },
+                { name: "b", value: "", enabled: true },
+                { name: "c", value: "ccc", enabled: true },
+              ],
+            },
+          }),
+        ],
+      },
+    });
+  });
+
+  test("Imports combined data params as form url-encoded", () => {
+    expect(convertCurl(`curl -d 'a=aaa&b=bbb&c' https://yaak.app`)).toEqual({
+      resources: {
+        workspaces: [baseWorkspace()],
+        httpRequests: [
+          baseRequest({
+            method: "POST",
+            url: "https://yaak.app",
+            bodyType: "application/x-www-form-urlencoded",
+            headers: [
+              {
+                name: "Content-Type",
+                value: "application/x-www-form-urlencoded",
+                enabled: true,
+              },
+            ],
+            body: {
+              form: [
+                { name: "a", value: "aaa", enabled: true },
+                { name: "b", value: "bbb", enabled: true },
+                { name: "c", value: "", enabled: true },
+              ],
+            },
+          }),
+        ],
+      },
+    });
+  });
+
+  test("Keeps an --data-urlencode value whole", () => {
+    // curl encodes the whole argument, so the `&` and the second `=` are data it
+    // percent-encodes, not separators. Splitting on them made two parameters
+    // out of one, and Yaak then re-sent `q=a&b=c` where curl sends
+    // `q=a%26b%3Dc`. One parameter here re-encodes back to what curl sends.
+    expect(convertCurl(`curl --data-urlencode 'q=a&b=c' https://yaak.app`)).toEqual({
+      resources: {
+        workspaces: [baseWorkspace()],
+        httpRequests: [
+          baseRequest({
+            method: "POST",
+            url: "https://yaak.app",
+            bodyType: "application/x-www-form-urlencoded",
+            headers: [
+              {
+                name: "Content-Type",
+                value: "application/x-www-form-urlencoded",
+                enabled: true,
+              },
+            ],
+            body: {
+              form: [{ name: "q", value: "a&b=c", enabled: true }],
+            },
+          }),
+        ],
+      },
+    });
+  });
+
+  test("Imports a data value that is not valid percent-encoding", () => {
+    // curl sends a `-d` value verbatim and does not require it to decode, so
+    // a lone `%` is an ordinary form value. decodeURIComponent threw URIError
+    // on it and failed the whole import.
+    expect(convertCurl(`curl -d 'a=100%' https://yaak.app`)).toEqual({
+      resources: {
+        workspaces: [baseWorkspace()],
+        httpRequests: [
+          baseRequest({
+            method: "POST",
+            url: "https://yaak.app",
+            bodyType: "application/x-www-form-urlencoded",
+            headers: [
+              {
+                name: "Content-Type",
+                value: "application/x-www-form-urlencoded",
+                enabled: true,
+              },
+            ],
+            body: {
+              form: [{ name: "a", value: "100%", enabled: true }],
+            },
+          }),
+        ],
+      },
+    });
+  });
+
+  test("Keeps a valid escape decoded when the value also holds a stray percent", () => {
+    // Handing the whole value back untouched would leave `%25` to be encoded a
+    // second time on send, so each valid run decodes on its own.
+    expect(convertCurl(`curl -d 'a=50%25 and 100%' https://yaak.app`)).toEqual({
+      resources: {
+        workspaces: [baseWorkspace()],
+        httpRequests: [
+          baseRequest({
+            method: "POST",
+            url: "https://yaak.app",
+            bodyType: "application/x-www-form-urlencoded",
+            headers: [
+              {
+                name: "Content-Type",
+                value: "application/x-www-form-urlencoded",
+                enabled: true,
+              },
+            ],
+            body: {
+              form: [{ name: "a", value: "50% and 100%", enabled: true }],
+            },
+          }),
+        ],
+      },
+    });
+  });
+
+  test("Decodes -G --data-urlencode into the query string", () => {
+    // `-G` puts the data in the query string, which is encoded on send just
+    // like the form body, so the value has to arrive here decoded or it goes
+    // out encoded twice.
+    expect(convertCurl(`curl -G --data-urlencode 'q=a&b' https://yaak.app`)).toEqual({
+      resources: {
+        workspaces: [baseWorkspace()],
+        httpRequests: [
+          baseRequest({
+            url: "https://yaak.app",
+            urlParameters: [{ name: "q", value: "a&b", enabled: true }],
+          }),
+        ],
+      },
+    });
+  });
+
+  test("Imports data params as text", () => {
+    expect(
+      convertCurl("curl -H Content-Type:text/plain -d a -d b -d c=ccc https://yaak.app"),
+    ).toEqual({
+      resources: {
+        workspaces: [baseWorkspace()],
+        httpRequests: [
+          baseRequest({
+            method: "POST",
+            url: "https://yaak.app",
+            headers: [{ name: "Content-Type", value: "text/plain", enabled: true }],
+            bodyType: "text/plain",
+            body: { text: "a&b&c=ccc" },
+          }),
+        ],
+      },
+    });
+  });
+
+  test("Imports post data into URL", () => {
+    expect(convertCurl("curl -G https://api.stripe.com/v1/payment_links -d limit=3")).toEqual({
+      resources: {
+        workspaces: [baseWorkspace()],
+        httpRequests: [
+          baseRequest({
+            method: "GET",
+            url: "https://api.stripe.com/v1/payment_links",
+            urlParameters: [
+              {
+                enabled: true,
+                name: "limit",
+                value: "3",
+              },
+            ],
+          }),
+        ],
+      },
+    });
+  });
+
+  test("Imports multi-line JSON", () => {
+    expect(
+      convertCurl(
+        `curl -H Content-Type:application/json -d $'{\n  "foo":"bar"\n}' https://yaak.app`,
+      ),
+    ).toEqual({
+      resources: {
+        workspaces: [baseWorkspace()],
+        httpRequests: [
+          baseRequest({
+            method: "POST",
+            url: "https://yaak.app",
+            headers: [{ name: "Content-Type", value: "application/json", enabled: true }],
+            bodyType: "application/json",
+            body: { text: '{\n  "foo":"bar"\n}' },
+          }),
+        ],
+      },
+    });
+  });
+
+  test("Imports multiple headers", () => {
+    expect(
+      convertCurl("curl -H Foo:bar --header Name -H AAA:bbb -H :ccc https://yaak.app"),
+    ).toEqual({
+      resources: {
+        workspaces: [baseWorkspace()],
+        httpRequests: [
+          baseRequest({
+            url: "https://yaak.app",
+            headers: [
+              { name: "Name", value: "", enabled: true },
+              { name: "Foo", value: "bar", enabled: true },
+              { name: "AAA", value: "bbb", enabled: true },
+              { name: "", value: "ccc", enabled: true },
+            ],
+          }),
+        ],
+      },
+    });
+  });
+
+  test("Imports basic auth", () => {
+    expect(convertCurl("curl --user user:pass https://yaak.app")).toEqual({
+      resources: {
+        workspaces: [baseWorkspace()],
+        httpRequests: [
+          baseRequest({
+            url: "https://yaak.app",
+            authenticationType: "basic",
+            authentication: {
+              username: "user",
+              password: "pass",
+            },
+          }),
+        ],
+      },
+    });
+  });
+
+  test("Imports digest auth", () => {
+    expect(convertCurl("curl --digest --user user:pass https://yaak.app")).toEqual({
+      resources: {
+        workspaces: [baseWorkspace()],
+        httpRequests: [
+          baseRequest({
+            url: "https://yaak.app",
+            authenticationType: "digest",
+            authentication: {
+              username: "user",
+              password: "pass",
+            },
+          }),
+        ],
+      },
+    });
+  });
+
+  test("Imports Bearer token from Authorization header", () => {
+    expect(convertCurl('curl -H "Authorization: Bearer token123" https://yaak.app')).toEqual({
+      resources: {
+        workspaces: [baseWorkspace()],
+        httpRequests: [
+          baseRequest({
+            url: "https://yaak.app",
+            authenticationType: "bearer",
+            authentication: {
+              token: "token123",
+              prefix: "Bearer",
+            },
+            headers: [],
+          }),
+        ],
+      },
+    });
+  });
+
+  test("Trims whitespace before Bearer token from Authorization header", () => {
+    expect(convertCurl('curl -H "Authorization: Bearer    token123" https://yaak.app')).toEqual({
+      resources: {
+        workspaces: [baseWorkspace()],
+        httpRequests: [
+          baseRequest({
+            url: "https://yaak.app",
+            authenticationType: "bearer",
+            authentication: {
+              token: "token123",
+              prefix: "Bearer",
+            },
+            headers: [],
+          }),
+        ],
+      },
+    });
+  });
+
+  test("Imports Basic auth from Authorization header (base64 decoded)", () => {
+    expect(
+      convertCurl('curl -H "Authorization: Basic dXNlcjpwYXNzd29yZA==" https://yaak.app'),
+    ).toEqual({
+      resources: {
+        workspaces: [baseWorkspace()],
+        httpRequests: [
+          baseRequest({
+            url: "https://yaak.app",
+            authenticationType: "basic",
+            authentication: {
+              username: "user",
+              password: "password",
+            },
+            headers: [],
+          }),
+        ],
+      },
+    });
+  });
+
+  test("Authorization header takes precedence over -u flag", () => {
+    expect(
+      convertCurl('curl -u admin:secret -H "Authorization: Bearer token123" https://yaak.app'),
+    ).toEqual({
+      resources: {
+        workspaces: [baseWorkspace()],
+        httpRequests: [
+          baseRequest({
+            url: "https://yaak.app",
+            authenticationType: "bearer",
+            authentication: {
+              token: "token123",
+              prefix: "Bearer",
+            },
+            headers: [],
+          }),
+        ],
+      },
+    });
+  });
+
+  test("Authorization header extraction is case-insensitive", () => {
+    expect(convertCurl('curl -H "authorization: bearer lowercaseToken" https://yaak.app')).toEqual({
+      resources: {
+        workspaces: [baseWorkspace()],
+        httpRequests: [
+          baseRequest({
+            url: "https://yaak.app",
+            authenticationType: "bearer",
+            authentication: {
+              token: "lowercaseToken",
+              prefix: "Bearer",
+            },
+            headers: [],
+          }),
+        ],
+      },
+    });
+  });
+
+  test("Preserves other headers when extracting Authorization", () => {
+    expect(
+      convertCurl('curl -H "Authorization: Bearer token123" -H "X-Custom: value" https://yaak.app'),
+    ).toEqual({
+      resources: {
+        workspaces: [baseWorkspace()],
+        httpRequests: [
+          baseRequest({
+            url: "https://yaak.app",
+            authenticationType: "bearer",
+            authentication: {
+              token: "token123",
+              prefix: "Bearer",
+            },
+            headers: [{ name: "X-Custom", value: "value", enabled: true }],
+          }),
+        ],
+      },
+    });
+  });
+
+  test("Invalid base64 in Basic auth keeps header in headers", () => {
+    expect(
+      convertCurl('curl -H "Authorization: Basic not-valid-base64!!!" https://yaak.app'),
+    ).toEqual({
+      resources: {
+        workspaces: [baseWorkspace()],
+        httpRequests: [
+          baseRequest({
+            url: "https://yaak.app",
+            headers: [{ name: "Authorization", value: "Basic not-valid-base64!!!", enabled: true }],
+          }),
+        ],
+      },
+    });
+  });
+
+  test("Imports cookie as header", () => {
+    expect(convertCurl('curl --cookie "foo=bar" https://yaak.app')).toEqual({
+      resources: {
+        workspaces: [baseWorkspace()],
+        httpRequests: [
+          baseRequest({
+            url: "https://yaak.app",
+            headers: [{ name: "Cookie", value: "foo=bar", enabled: true }],
+          }),
+        ],
+      },
+    });
+  });
+
+  test("Imports query params", () => {
+    expect(convertCurl('curl "https://yaak.app" --url-query foo=bar --url-query baz=qux')).toEqual({
+      resources: {
+        workspaces: [baseWorkspace()],
+        httpRequests: [
+          baseRequest({
+            url: "https://yaak.app",
+            urlParameters: [
+              { name: "foo", value: "bar", enabled: true },
+              { name: "baz", value: "qux", enabled: true },
+            ],
+          }),
+        ],
+      },
+    });
+  });
+
+  test("Imports query params from the URL", () => {
+    expect(convertCurl('curl "https://yaak.app?foo=bar&baz=a%20a"')).toEqual({
+      resources: {
+        workspaces: [baseWorkspace()],
+        httpRequests: [
+          baseRequest({
+            url: "https://yaak.app",
+            urlParameters: [
+              { name: "foo", value: "bar", enabled: true },
+              { name: "baz", value: "a a", enabled: true },
+            ],
+          }),
+        ],
+      },
+    });
+  });
+
+  test("Imports weird body", () => {
+    expect(convertCurl(`curl 'https://yaak.app' -X POST --data-raw 'foo=bar=baz'`)).toEqual({
+      resources: {
+        workspaces: [baseWorkspace()],
+        httpRequests: [
+          baseRequest({
+            url: "https://yaak.app",
+            method: "POST",
+            bodyType: "application/x-www-form-urlencoded",
+            body: {
+              form: [{ name: "foo", value: "bar=baz", enabled: true }],
+            },
+            headers: [
+              {
+                enabled: true,
+                name: "Content-Type",
+                value: "application/x-www-form-urlencoded",
+              },
+            ],
+          }),
+        ],
+      },
+    });
+  });
+
+  test("Imports data with Unicode escape sequences", () => {
+    expect(
+      convertCurl(
+        `curl 'https://yaak.app' -H 'Content-Type: application/json' --data-raw $'{"query":"SearchQueryInput\\u0021"}' -X POST`,
+      ),
+    ).toEqual({
+      resources: {
+        workspaces: [baseWorkspace()],
+        httpRequests: [
+          baseRequest({
+            url: "https://yaak.app",
+            method: "POST",
+            headers: [{ name: "Content-Type", value: "application/json", enabled: true }],
+            bodyType: "application/json",
+            body: { text: '{"query":"SearchQueryInput!"}' },
+          }),
+        ],
+      },
+    });
+  });
+
+  test("Imports GraphQL JSON data as a GraphQL request", () => {
+    expect(
+      convertCurl(
+        `curl 'https://yaak.app/graphql' -H 'Content-Type: application/json' --data-raw $'{"query":"query Search($id: ID\\u0021) { node(id: $id) { id } }","variables":{"id":"123"}}'`,
+      ),
+    ).toEqual({
+      resources: {
+        workspaces: [baseWorkspace()],
+        httpRequests: [
+          baseRequest({
+            url: "https://yaak.app/graphql",
+            method: "POST",
+            headers: [{ name: "Content-Type", value: "application/json", enabled: true }],
+            bodyType: "graphql",
+            body: {
+              query: "query Search($id: ID!) { node(id: $id) { id } }",
+              variables: '{\n  "id": "123"\n}',
+            },
+          }),
+        ],
+      },
+    });
+  });
+
+  test("Imports GraphQL JSON with extensions as JSON", () => {
+    expect(
+      convertCurl(
+        `curl 'https://yaak.app/graphql' -H 'Content-Type: application/json' --data-raw $'{"query":"query Search($id: ID\\u0021) { node(id: $id) { id } }","extensions":{"persistedQuery":{"version":1,"sha256Hash":"abc123"}}}'`,
+      ),
+    ).toEqual({
+      resources: {
+        workspaces: [baseWorkspace()],
+        httpRequests: [
+          baseRequest({
+            url: "https://yaak.app/graphql",
+            method: "POST",
+            headers: [{ name: "Content-Type", value: "application/json", enabled: true }],
+            bodyType: "application/json",
+            body: {
+              text: '{"query":"query Search($id: ID!) { node(id: $id) { id } }","extensions":{"persistedQuery":{"version":1,"sha256Hash":"abc123"}}}',
+            },
+          }),
+        ],
+      },
+    });
+  });
+
+  test("Imports data with multiple escape sequences", () => {
+    expect(
+      convertCurl(
+        `curl 'https://yaak.app' --data-raw $'Line1\\nLine2\\tTab\\u0021Exclamation' -X POST`,
+      ),
+    ).toEqual({
+      resources: {
+        workspaces: [baseWorkspace()],
+        httpRequests: [
+          baseRequest({
+            url: "https://yaak.app",
+            method: "POST",
+            bodyType: "application/x-www-form-urlencoded",
+            body: {
+              form: [{ name: "Line1\nLine2\tTab!Exclamation", value: "", enabled: true }],
+            },
+            headers: [
+              {
+                enabled: true,
+                name: "Content-Type",
+                value: "application/x-www-form-urlencoded",
+              },
+            ],
+          }),
+        ],
+      },
+    });
+  });
+
+  test("Imports multipart form data from --data-raw (Chrome DevTools format)", () => {
+    // This is the format Chrome DevTools uses when copying a multipart form submission as cURL
+    const curlCommand = `curl 'http://localhost:8080/system' \
+  -H 'Content-Type: multipart/form-data; boundary=----WebKitFormBoundaryHwsXKi4rKA6P5VBd' \
+  --data-raw $'------WebKitFormBoundaryHwsXKi4rKA6P5VBd\r\nContent-Disposition: form-data; name="username"\r\n\r\njsgj\r\n------WebKitFormBoundaryHwsXKi4rKA6P5VBd\r\nContent-Disposition: form-data; name="password"\r\n\r\n654321\r\n------WebKitFormBoundaryHwsXKi4rKA6P5VBd\r\nContent-Disposition: form-data; name="captcha"; filename="test.xlsx"\r\nContent-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet\r\n\r\n\r\n------WebKitFormBoundaryHwsXKi4rKA6P5VBd--\r\n'`;
+
+    expect(convertCurl(curlCommand)).toEqual({
+      resources: {
+        workspaces: [baseWorkspace()],
+        httpRequests: [
+          baseRequest({
+            url: "http://localhost:8080/system",
+            method: "POST",
+            headers: [
+              {
+                name: "Content-Type",
+                value: "multipart/form-data; boundary=----WebKitFormBoundaryHwsXKi4rKA6P5VBd",
+                enabled: true,
+              },
+            ],
+            bodyType: "multipart/form-data",
+            body: {
+              form: [
+                { name: "username", value: "jsgj", enabled: true },
+                { name: "password", value: "654321", enabled: true },
+                { name: "captcha", file: "test.xlsx", enabled: true },
+              ],
+            },
+          }),
+        ],
+      },
+    });
+  });
+
+  test("Imports JSON body with newlines in $quotes", () => {
+    expect(
+      convertCurl(
+        `curl 'https://yaak.app' -H 'Content-Type: application/json' --data-raw $'{\\n  "foo": "bar",\\n  "baz": "qux"\\n}' -X POST`,
+      ),
+    ).toEqual({
+      resources: {
+        workspaces: [baseWorkspace()],
+        httpRequests: [
+          baseRequest({
+            url: "https://yaak.app",
+            method: "POST",
+            headers: [{ name: "Content-Type", value: "application/json", enabled: true }],
+            bodyType: "application/json",
+            body: { text: '{\n  "foo": "bar",\n  "baz": "qux"\n}' },
+          }),
+        ],
+      },
+    });
+  });
+
+  test("Handles double-quoted string ending with even backslashes before semicolon", () => {
+    // "C:\\" has two backslashes which escape each other, so the closing " is real.
+    // The ; after should split into a second command.
+    expect(convertCurl('curl -d "C:\\\\" https://yaak.app;curl https://example.com')).toEqual({
+      resources: {
+        workspaces: [baseWorkspace()],
+        httpRequests: [
+          baseRequest({
+            url: "https://yaak.app",
+            method: "POST",
+            bodyType: "application/x-www-form-urlencoded",
+            body: {
+              form: [{ name: "C:\\", value: "", enabled: true }],
+            },
+            headers: [
+              {
+                name: "Content-Type",
+                value: "application/x-www-form-urlencoded",
+                enabled: true,
+              },
+            ],
+          }),
+          baseRequest({ url: "https://example.com" }),
+        ],
+      },
+    });
+  });
+
+  test("Handles $quoted string ending with a literal backslash before semicolon", () => {
+    // $'C:\\\\' has two backslashes which become one literal backslash.
+    // The closing ' must not be misinterpreted as escaped.
+    // The ; after should split into a second command.
+    expect(convertCurl("curl -d $'C:\\\\' https://yaak.app;curl https://example.com")).toEqual({
+      resources: {
+        workspaces: [baseWorkspace()],
+        httpRequests: [
+          baseRequest({
+            url: "https://yaak.app",
+            method: "POST",
+            bodyType: "application/x-www-form-urlencoded",
+            body: {
+              form: [{ name: "C:\\", value: "", enabled: true }],
+            },
+            headers: [
+              {
+                name: "Content-Type",
+                value: "application/x-www-form-urlencoded",
+                enabled: true,
+              },
+            ],
+          }),
+          baseRequest({ url: "https://example.com" }),
+        ],
+      },
+    });
+  });
+
+  test("Imports $quoted header with escaped single quotes", () => {
+    expect(convertCurl(`curl https://yaak.app -H $'X-Custom: it\\'s a test'`)).toEqual({
+      resources: {
+        workspaces: [baseWorkspace()],
+        httpRequests: [
+          baseRequest({
+            url: "https://yaak.app",
+            headers: [{ name: "X-Custom", value: "it's a test", enabled: true }],
+          }),
+        ],
+      },
+    });
+  });
+
+  test("Does not split on escaped semicolon outside quotes", () => {
+    // In shell, \; is a literal semicolon and should not split commands.
+    // This should be treated as a single curl command with the URL "https://yaak.app?a=1;b=2"
+    expect(convertCurl("curl https://yaak.app?a=1\\;b=2")).toEqual({
+      resources: {
+        workspaces: [baseWorkspace()],
+        httpRequests: [
+          baseRequest({
+            url: "https://yaak.app",
+            urlParameters: [{ name: "a", value: "1;b=2", enabled: true }],
+          }),
+        ],
+      },
+    });
+  });
+
+  test("Imports multipart form data with text-only fields from --data-raw", () => {
+    const curlCommand = `curl 'http://example.com/api' \
+  -H 'Content-Type: multipart/form-data; boundary=----FormBoundary123' \
+  --data-raw $'------FormBoundary123\r\nContent-Disposition: form-data; name="field1"\r\n\r\nvalue1\r\n------FormBoundary123\r\nContent-Disposition: form-data; name="field2"\r\n\r\nvalue2\r\n------FormBoundary123--\r\n'`;
+
+    expect(convertCurl(curlCommand)).toEqual({
+      resources: {
+        workspaces: [baseWorkspace()],
+        httpRequests: [
+          baseRequest({
+            url: "http://example.com/api",
+            method: "POST",
+            headers: [
+              {
+                name: "Content-Type",
+                value: "multipart/form-data; boundary=----FormBoundary123",
+                enabled: true,
+              },
+            ],
+            bodyType: "multipart/form-data",
+            body: {
+              form: [
+                { name: "field1", value: "value1", enabled: true },
+                { name: "field2", value: "value2", enabled: true },
+              ],
+            },
+          }),
+        ],
+      },
+    });
+  });
+  test("Keeps an = inside a --url-query value", () => {
+    const imported = convertCurl(
+      'curl --url-query "filter=type=book" --url-query "t=eyJhIjoxfQ==" https://yaak.app',
+    );
+    expect(imported.resources.httpRequests?.[0]?.urlParameters).toEqual([
+      { enabled: true, name: "filter", value: "type=book" },
+      { enabled: true, name: "t", value: "eyJhIjoxfQ==" },
+    ]);
+  });
+
+  test("Keeps an = inside a form value", () => {
+    const imported = convertCurl('curl -F "t=eyJhIjoxfQ==" -F "q=a=b" https://yaak.app');
+    expect(imported.resources.httpRequests?.[0]?.body?.form).toEqual([
+      { enabled: true, name: "t", value: "eyJhIjoxfQ==" },
+      { enabled: true, name: "q", value: "a=b" },
+    ]);
+  });
+
+  test("Emits no source keys", () => {
+    expect(convertCurl("curl https://yaak.app")).not.toHaveProperty("sourceKeys");
+  });
+});
+
+const idCount: Partial<Record<string, number>> = {};
+
+function baseRequest(mergeWith: Partial<HttpRequest>) {
+  idCount.http_request = (idCount.http_request ?? -1) + 1;
+  return {
+    id: `GENERATE_ID::HTTP_REQUEST_${idCount.http_request}`,
+    model: "http_request",
+    authentication: {},
+    authenticationType: null,
+    body: {},
+    bodyType: null,
+    folderId: null,
+    headers: [],
+    method: "GET",
+    name: "",
+    sortPriority: 0,
+    url: "",
+    urlParameters: [],
+    workspaceId: `GENERATE_ID::WORKSPACE_${idCount.workspace}`,
+    ...mergeWith,
+  };
+}
+
+function baseWorkspace(mergeWith: Partial<Workspace> = {}) {
+  idCount.workspace = (idCount.workspace ?? -1) + 1;
+  return {
+    id: `GENERATE_ID::WORKSPACE_${idCount.workspace}`,
+    model: "workspace",
+    name: "Curl Import",
+    ...mergeWith,
+  };
+}

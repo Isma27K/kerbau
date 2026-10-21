@@ -1,0 +1,176 @@
+use crate::error::Result;
+use crate::models::{AnyModel, UpsertModelInfo};
+use crate::util::{ModelChangeEvent, ModelPayload, UpdateSource};
+use rusqlite::params;
+use sea_query::{IntoColumnRef, IntoIden, SimpleExpr};
+use std::cell::RefCell;
+use std::fmt::Debug;
+use std::ops::Deref;
+use yaak_database::DbContext;
+
+/// A read handle. Comes from the reader pool and can only query.
+///
+/// Anything that changes a row lives on [`WriteDb`], which is only ever handed
+/// out inside a transaction on the single writer connection. That split is
+/// what keeps the pool from filling with writers waiting on each other: there
+/// is one writer, so there is never a second one to wait for.
+pub struct ClientDb<'a> {
+    pub(crate) ctx: DbContext<'a>,
+}
+
+impl<'a> ClientDb<'a> {
+    pub fn new(ctx: DbContext<'a>) -> Self {
+        Self { ctx }
+    }
+
+    /// Access the underlying connection for custom queries.
+    pub(crate) fn conn(&self) -> &yaak_database::ConnectionOrTx<'a> {
+        self.ctx.conn()
+    }
+
+    pub(crate) fn find_one<M>(
+        &self,
+        col: impl IntoColumnRef + IntoIden + Clone,
+        value: impl Into<SimpleExpr> + Debug,
+    ) -> Result<M>
+    where
+        M: UpsertModelInfo,
+    {
+        Ok(self.ctx.find_one(col, value)?)
+    }
+
+    pub(crate) fn find_optional<M>(
+        &self,
+        col: impl IntoColumnRef,
+        value: impl Into<SimpleExpr>,
+    ) -> Option<M>
+    where
+        M: UpsertModelInfo,
+    {
+        self.ctx.find_optional(col, value)
+    }
+
+    pub(crate) fn find_all<M>(&self) -> Result<Vec<M>>
+    where
+        M: UpsertModelInfo,
+    {
+        Ok(self.ctx.find_all()?)
+    }
+
+    pub(crate) fn find_many<M>(
+        &self,
+        col: impl IntoColumnRef,
+        value: impl Into<SimpleExpr>,
+        limit: Option<u64>,
+    ) -> Result<Vec<M>>
+    where
+        M: UpsertModelInfo,
+    {
+        Ok(self.ctx.find_many(col, value, limit)?)
+    }
+}
+
+/// A write handle: a [`ClientDb`] on the writer connection, inside a
+/// transaction, that can also change rows. Derefs to [`ClientDb`] so every
+/// query is available while writing, and reads inside the transaction see
+/// its own uncommitted writes.
+///
+/// Model events are held back until the transaction commits; a rollback
+/// discards them along with the rows.
+pub struct WriteDb<'a> {
+    db: ClientDb<'a>,
+    pending_events: RefCell<Vec<ModelPayload>>,
+}
+
+impl<'a> Deref for WriteDb<'a> {
+    type Target = ClientDb<'a>;
+
+    fn deref(&self) -> &ClientDb<'a> {
+        &self.db
+    }
+}
+
+impl<'a> WriteDb<'a> {
+    pub fn new(ctx: DbContext<'a>) -> Self {
+        Self { db: ClientDb::new(ctx), pending_events: RefCell::new(Vec::new()) }
+    }
+
+    /// The events for everything written so far, to send once the
+    /// transaction has committed.
+    pub(crate) fn into_events(self) -> Vec<ModelPayload> {
+        self.pending_events.into_inner()
+    }
+
+    /// Bulk-delete all rows matching a column value WITHOUT recording model
+    /// changes or emitting events. Only use for cascades whose deletion is
+    /// implied by a recorded parent delete (e.g. workspace children — see
+    /// [`ModelChangeEvent::Delete`]).
+    pub(crate) fn delete_many_untracked<M>(
+        &self,
+        col: impl IntoColumnRef,
+        value: impl Into<SimpleExpr>,
+    ) -> Result<usize>
+    where
+        M: UpsertModelInfo,
+    {
+        Ok(self.ctx.delete_many::<M>(col, value)?)
+    }
+
+    pub(crate) fn upsert<M>(&self, model: &M, source: &UpdateSource) -> Result<M>
+    where
+        M: Into<AnyModel> + UpsertModelInfo + Clone,
+    {
+        let (m, created) = self.ctx.upsert(model, &source.to_db())?;
+
+        let payload = ModelPayload {
+            model: m.clone().into(),
+            update_source: source.clone(),
+            change: ModelChangeEvent::Upsert { created },
+        };
+
+        self.record_model_change(&payload)?;
+        self.pending_events.borrow_mut().push(payload);
+
+        Ok(m)
+    }
+
+    pub(crate) fn delete<M>(&self, m: &M, source: &UpdateSource) -> Result<M>
+    where
+        M: Into<AnyModel> + Clone + UpsertModelInfo,
+    {
+        self.ctx.delete(m)?;
+
+        let payload = ModelPayload {
+            model: m.clone().into(),
+            update_source: source.clone(),
+            change: ModelChangeEvent::Delete,
+        };
+
+        self.record_model_change(&payload)?;
+        self.pending_events.borrow_mut().push(payload);
+
+        Ok(m.clone())
+    }
+
+    fn record_model_change(&self, payload: &ModelPayload) -> Result<()> {
+        let payload_json = serde_json::to_string(payload)?;
+        let source_json = serde_json::to_string(&payload.update_source)?;
+        let change_json = serde_json::to_string(&payload.change)?;
+
+        self.ctx.conn().resolve().execute(
+            r#"
+                INSERT INTO model_changes (model, model_id, change, update_source, payload)
+                VALUES (?1, ?2, ?3, ?4, ?5)
+            "#,
+            params![
+                payload.model.model(),
+                payload.model.id(),
+                change_json,
+                source_json,
+                payload_json,
+            ],
+        )?;
+
+        Ok(())
+    }
+}

@@ -1,0 +1,106 @@
+//! Tauri-specific extensions for yaak-sync.
+//!
+//! This module provides the Tauri commands for sync functionality.
+
+use crate::error::Result;
+use crate::models_ext::{BlobManagerExt, QueryManagerExt};
+use chrono::Utc;
+use log::warn;
+use std::path::Path;
+use tauri::{AppHandle, Listener, Runtime};
+use tokio::sync::watch;
+use yaak_rpc_schema::WatchResult;
+use yaak_sync::error::Error::InvalidSyncDirectory;
+use yaak_sync::sync::{
+    FsCandidate, SyncOp, apply_db_sync_ops, apply_fs_sync_ops, apply_sync_ops,
+    apply_sync_state_ops, compute_sync_ops, get_db_candidates, get_fs_candidates,
+};
+use yaak_sync::watch::{WatchEvent, watch_directory};
+
+pub(crate) async fn cmd_sync_calculate<R: Runtime>(
+    app_handle: AppHandle<R>,
+    workspace_id: &str,
+    sync_dir: &Path,
+) -> Result<Vec<SyncOp>> {
+    if !sync_dir.exists() {
+        return Err(InvalidSyncDirectory(sync_dir.to_string_lossy().to_string()).into());
+    }
+
+    let db = app_handle.db();
+    let version = app_handle.package_info().version.to_string();
+    let db_candidates = get_db_candidates(&db, &version, workspace_id, sync_dir)?;
+    let fs_candidates = get_fs_candidates(sync_dir, &db_candidates)?
+        .into_iter()
+        // Only keep items in the same workspace
+        .filter(|fs| fs.model.workspace_id() == workspace_id)
+        .collect::<Vec<FsCandidate>>();
+    Ok(compute_sync_ops(db_candidates, fs_candidates))
+}
+
+pub(crate) async fn cmd_sync_calculate_fs(dir: &Path) -> Result<Vec<SyncOp>> {
+    let db_candidates = Vec::new();
+    let fs_candidates = get_fs_candidates(dir, &db_candidates)?;
+    Ok(compute_sync_ops(db_candidates, fs_candidates))
+}
+
+pub(crate) async fn cmd_sync_apply<R: Runtime>(
+    app_handle: AppHandle<R>,
+    sync_ops: Vec<SyncOp>,
+    sync_dir: &Path,
+    workspace_id: &str,
+    fs_only: bool,
+) -> Result<bool> {
+    let blobs = app_handle.blob_manager();
+    if !fs_only || sync_ops.iter().any(|op| !matches!(op, SyncOp::DbCreate { .. })) {
+        let version = app_handle.package_info().version.to_string();
+        return Ok(apply_sync_ops(
+            &app_handle.db_manager(),
+            &blobs,
+            &version,
+            workspace_id,
+            sync_dir,
+            sync_ops,
+        )?);
+    }
+
+    // Opening a sync directory imports its files without existing DB sync state.
+    // Files first, so the write transaction never waits on the filesystem
+    let pending = apply_fs_sync_ops(workspace_id, sync_dir, sync_ops)?;
+    app_handle.db_manager().with_tx(|tx| {
+        let sync_state_ops = apply_db_sync_ops(tx, &blobs, workspace_id, sync_dir, pending)?;
+        apply_sync_state_ops(tx, workspace_id, sync_dir, sync_state_ops)?;
+        Ok(true)
+    })
+}
+
+pub(crate) async fn sync_watch<R, F>(
+    app_handle: AppHandle<R>,
+    sync_dir: &Path,
+    workspace_id: &str,
+    on_event: F,
+) -> Result<WatchResult>
+where
+    R: Runtime,
+    F: Fn(WatchEvent) + Send + Sync + 'static,
+{
+    let (cancel_tx, cancel_rx) = watch::channel(());
+
+    watch_directory(&sync_dir, on_event, cancel_rx).await?;
+
+    let app_handle_inner = app_handle.clone();
+    let unlisten_event =
+        format!("watch-unlisten-{}-{}", workspace_id, Utc::now().timestamp_millis());
+
+    // TODO: Figure out a way to unlisten when the client app_handle refreshes or closes. Perhaps with
+    //   a heartbeat mechanism, or ensuring only a single subscription per workspace (at least
+    //   this won't create `n` subs). We could also maybe have a global fs watcher that we keep
+    //   adding to here.
+    app_handle.listen_any(unlisten_event.clone(), move |event| {
+        app_handle_inner.unlisten(event.id());
+        if let Err(e) = cancel_tx.send(()) {
+            warn!("Failed to send cancel signal to watcher {e:?}");
+        }
+    });
+
+    Ok(WatchResult { unlisten_event })
+}

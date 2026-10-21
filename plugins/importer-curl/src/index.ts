@@ -1,0 +1,777 @@
+import type {
+  Context,
+  Environment,
+  Folder,
+  HttpRequest,
+  HttpUrlParameter,
+  ImportSource,
+  PluginDefinition,
+  Workspace,
+} from "@yaakapp/api";
+import { split } from "shlex";
+import { parseGraphQLJsonBody } from "./graphql";
+
+type AtLeast<T, K extends keyof T> = Partial<T> & Pick<T, K>;
+
+interface ExportResources {
+  workspaces: AtLeast<Workspace, "name" | "id" | "model">[];
+  environments: AtLeast<Environment, "name" | "id" | "model" | "workspaceId">[];
+  httpRequests: AtLeast<HttpRequest, "name" | "id" | "model" | "workspaceId">[];
+  folders: AtLeast<Folder, "name" | "id" | "model" | "workspaceId">[];
+}
+
+const DATA_FLAGS = ["d", "data", "data-raw", "data-urlencode", "data-binary", "data-ascii"];
+const SUPPORTED_FLAGS = [
+  ["cookie", "b"],
+  ["d", "data"], // Add url encoded data
+  ["data-ascii"],
+  ["data-binary"],
+  ["data-raw"],
+  ["data-urlencode"],
+  ["digest"], // Apply auth as digest
+  ["form", "F"], // Add multipart data
+  ["get", "G"], // Put the post data in the URL
+  ["header", "H"],
+  ["request", "X"], // Request method
+  ["url"], // Specify the URL explicitly
+  ["url-query"],
+  ["user", "u"], // Authentication
+  DATA_FLAGS,
+].flat();
+
+const BOOLEAN_FLAGS = ["G", "get", "digest"];
+
+// Short flags that consume a value, derived so this stays in step with the
+// tables above.
+const VALUE_SHORT_FLAGS = SUPPORTED_FLAGS.flat().filter(
+  (name) => name.length === 1 && !BOOLEAN_FLAGS.includes(name),
+);
+
+/**
+ * Expand a short-flag token into separate arguments.
+ *
+ * curl reads a short cluster left to right, one option per character, until an
+ * option that takes a value — that one swallows the rest of the cluster. So
+ * `-XPOST` is `-X POST`, but `-fsSL` is four boolean flags rather than `-f`
+ * plus a value. Splitting unconditionally after the first character left
+ * `sSL` as a positional argument, and the first positional is read as the URL:
+ * `curl -fsSL https://example.com` imported with a URL of `sSL`.
+ */
+function expandShortFlags(token: string): string[] {
+  if (!token.startsWith("-") || token.startsWith("--") || token.length <= 2) {
+    return [token];
+  }
+
+  const expanded: string[] = [];
+  for (let i = 1; i < token.length; i++) {
+    const name = token[i] ?? "";
+    expanded.push(`-${name}`);
+
+    if (VALUE_SHORT_FLAGS.includes(name)) {
+      const value = token.slice(i + 1);
+      if (value) {
+        expanded.push(value);
+      }
+      break;
+    }
+  }
+
+  return expanded;
+}
+
+type FlagValue = string | boolean;
+
+type FlagsByName = Record<string, FlagValue[]>;
+
+export const plugin: PluginDefinition = {
+  importer: {
+    name: "cURL",
+    description: "Import cURL commands",
+    onImportSource(_ctx: Context, { source }: { source: ImportSource }) {
+      if (source.type !== "text") return null;
+      // oxlint-disable-next-line no-explicit-any
+      return convertCurl(source.text) as any;
+    },
+  },
+};
+
+/**
+ * Splits raw input into individual shell command strings.
+ * Handles line continuations, semicolons, and newline-separated curl commands.
+ */
+function splitCommands(rawData: string): string[] {
+  // Join line continuations (backslash-newline, and backslash-CRLF for
+  // Windows). Trailing spaces or tabs after the backslash are common when a
+  // command is copied from a terminal or a doc, and the shell treats
+  // "\ <newline>" as an escaped space rather than a continuation, so accept
+  // them here to keep the pasted command in one piece.
+  const joined = rawData.replace(/\\[ \t]*\r?\n/g, " ");
+
+  // Count consecutive backslashes immediately before position i.
+  // An even count means the quote at i is NOT escaped; odd means it IS escaped.
+  function isEscaped(i: number): boolean {
+    let backslashes = 0;
+    let j = i - 1;
+    while (j >= 0 && joined[j] === "\\") {
+      backslashes++;
+      j--;
+    }
+    return backslashes % 2 !== 0;
+  }
+
+  // Split on semicolons and newlines to separate commands
+  const commands: string[] = [];
+  let current = "";
+  let inSingleQuote = false;
+  let inDoubleQuote = false;
+  let inDollarQuote = false;
+
+  for (let i = 0; i < joined.length; i++) {
+    if (joined[i] === undefined) break; // Make TS happy
+
+    const ch = joined[i];
+    const next = joined[i + 1];
+
+    // Track quoting state to avoid splitting inside quoted strings
+    if (!inDoubleQuote && !inDollarQuote && ch === "'" && !inSingleQuote) {
+      inSingleQuote = true;
+      current += ch;
+      continue;
+    }
+    if (inSingleQuote && ch === "'") {
+      inSingleQuote = false;
+      current += ch;
+      continue;
+    }
+    if (!inSingleQuote && !inDollarQuote && ch === '"' && !inDoubleQuote) {
+      inDoubleQuote = true;
+      current += ch;
+      continue;
+    }
+    if (inDoubleQuote && ch === '"' && !isEscaped(i)) {
+      inDoubleQuote = false;
+      current += ch;
+      continue;
+    }
+    if (!inSingleQuote && !inDoubleQuote && !inDollarQuote && ch === "$" && next === "'") {
+      inDollarQuote = true;
+      current += ch + next;
+      i++; // Skip the opening quote
+      continue;
+    }
+    if (inDollarQuote && ch === "'" && !isEscaped(i)) {
+      inDollarQuote = false;
+      current += ch;
+      continue;
+    }
+
+    const inQuote = inSingleQuote || inDoubleQuote || inDollarQuote;
+
+    // Split on ;, newline, or CRLF when not inside quotes and not escaped
+    if (
+      !inQuote &&
+      !isEscaped(i) &&
+      (ch === ";" || ch === "\n" || (ch === "\r" && next === "\n"))
+    ) {
+      if (ch === "\r") i++; // Skip the \n in \r\n
+      if (current.trim()) {
+        commands.push(current.trim());
+      }
+      current = "";
+      continue;
+    }
+
+    current += ch;
+  }
+
+  if (current.trim()) {
+    commands.push(current.trim());
+  }
+
+  return commands;
+}
+
+export function convertCurl(rawData: string) {
+  if (!rawData.match(/^\s*curl /)) {
+    return null;
+  }
+
+  const commands: string[][] = splitCommands(rawData).map((cmd) => {
+    const tokens = split(cmd);
+    return tokens.flatMap(expandShortFlags);
+  });
+
+  const workspace: ExportResources["workspaces"][0] = {
+    model: "workspace",
+    id: generateId("workspace"),
+    name: "Curl Import",
+  };
+
+  const requests: ExportResources["httpRequests"] = commands
+    .filter((command) => command[0] === "curl")
+    .map((v) => importCommand(v, workspace.id));
+
+  return {
+    resources: {
+      httpRequests: requests,
+      workspaces: [workspace],
+    },
+  };
+}
+
+interface ExtractedAuthentication {
+  authenticationType: string | null;
+  authentication: Record<string, string>;
+  filteredHeaders: HttpUrlParameter[]; // headers without authorization
+}
+
+function extractAuthenticationFromHeaders(headers: HttpUrlParameter[]): ExtractedAuthentication {
+  const authorizationHeaderIndex = headers.findIndex(
+    (h) => h.name.toLowerCase() === "authorization",
+  );
+
+  const authorizationHeader = headers[authorizationHeaderIndex];
+  if (authorizationHeader == null) {
+    return {
+      authenticationType: null,
+      authentication: {},
+      filteredHeaders: headers,
+    };
+  }
+
+  const value = authorizationHeader.value.trim();
+  const spaceIndex = value.indexOf(" ");
+
+  if (spaceIndex <= 0) {
+    return {
+      authenticationType: null,
+      authentication: {},
+      filteredHeaders: headers,
+    };
+  }
+
+  const scheme = value.slice(0, spaceIndex).toLowerCase();
+  const credentials = value.slice(spaceIndex + 1).trim();
+
+  // Bearer authentication (RFC 6750)
+  if (scheme === "bearer") {
+    const filteredHeaders = headers.filter((_, i) => i !== authorizationHeaderIndex);
+    return {
+      authenticationType: "bearer",
+      authentication: { token: credentials, prefix: "Bearer" },
+      filteredHeaders,
+    };
+  }
+
+  // Basic authentication (RFC 7617)
+  if (scheme === "basic") {
+    try {
+      const decoded = Buffer.from(credentials, "base64").toString();
+      const colonIndex = decoded.indexOf(":");
+      if (colonIndex > 0) {
+        const filteredHeaders = headers.filter((_, i) => i !== authorizationHeaderIndex);
+        return {
+          authenticationType: "basic",
+          authentication: {
+            username: decoded.slice(0, colonIndex),
+            password: decoded.slice(colonIndex + 1),
+          },
+          filteredHeaders,
+        };
+      }
+    } catch {
+      // Invalid base64, keep header as-is
+    }
+  }
+
+  return {
+    authenticationType: null,
+    authentication: {},
+    filteredHeaders: headers,
+  };
+}
+
+function importCommand(parseEntries: string[], workspaceId: string) {
+  // ~~~~~~~~~~~~~~~~~~~~~ //
+  // Collect all the flags //
+  // ~~~~~~~~~~~~~~~~~~~~~ //
+  const flagsByName: FlagsByName = {};
+  const singletons: string[] = [];
+
+  // Start at 1 so we can skip the ^curl part
+  for (let i = 1; i < parseEntries.length; i++) {
+    let parseEntry = parseEntries[i];
+    if (typeof parseEntry === "string") {
+      parseEntry = parseEntry.trim();
+    }
+
+    if (typeof parseEntry === "string" && parseEntry.match(/^-{1,2}[\w-]+/)) {
+      const isSingleDash = parseEntry[0] === "-" && parseEntry[1] !== "-";
+      let name = parseEntry.replace(/^-{1,2}/, "");
+
+      if (!SUPPORTED_FLAGS.includes(name)) {
+        continue;
+      }
+
+      let value: string | boolean;
+      const nextEntry = parseEntries[i + 1];
+      const hasValue = !BOOLEAN_FLAGS.includes(name);
+      // Check if nextEntry looks like a flag:
+      // - Single dash followed by a letter: -X, -H, -d
+      // - Double dash followed by a letter: --data-raw, --header
+      // This prevents mistaking data that starts with dashes (like multipart boundaries ------) as flags
+      const nextEntryIsFlag =
+        typeof nextEntry === "string" &&
+        (nextEntry.match(/^-[a-zA-Z]/) || nextEntry.match(/^--[a-zA-Z]/));
+      if (isSingleDash && name.length > 1) {
+        // Handle squished arguments like -XPOST
+        value = name.slice(1);
+        name = name.slice(0, 1);
+      } else if (typeof nextEntry === "string" && hasValue && !nextEntryIsFlag) {
+        // Next arg is not a flag, so assign it as the value
+        value = nextEntry;
+        i++; // Skip next one
+      } else {
+        value = true;
+      }
+
+      flagsByName[name] = flagsByName[name] || [];
+      flagsByName[name]?.push(value);
+    } else if (parseEntry) {
+      singletons.push(parseEntry);
+    }
+  }
+
+  // ~~~~~~~~~~~~~~~~~ //
+  // Build the request //
+  // ~~~~~~~~~~~~~~~~~ //
+
+  const urlArg = getPairValue(flagsByName, (singletons[0] as string) || "", ["url"]);
+  const [baseUrl, search] = splitOnce(urlArg, "?");
+  const urlParameters: HttpUrlParameter[] =
+    search?.split("&").map((p) => {
+      const v = splitOnce(p, "=");
+      return {
+        name: decodeURIComponent(v[0] ?? ""),
+        value: decodeURIComponent(v[1] ?? ""),
+        enabled: true,
+      };
+    }) ?? [];
+
+  const url = baseUrl ?? urlArg;
+
+  // Query params
+  for (const p of flagsByName["url-query"] ?? []) {
+    if (typeof p !== "string") {
+      continue;
+    }
+    // splitOnce: a query value may itself contain "=" (a base64 payload, a
+    // nested filter), and only the first one separates name from value.
+    const [name, value] = splitOnce(p, "=");
+    urlParameters.push({
+      name: name ?? "",
+      value: value ?? "",
+      enabled: true,
+    });
+  }
+
+  // Authentication
+  const [username, password] = getPairValue(flagsByName, "", ["u", "user"]).split(/:(.*)$/);
+
+  const isDigest = getPairValue(flagsByName, false, ["digest"]);
+  const authenticationType = username ? (isDigest ? "digest" : "basic") : null;
+  const authentication = username
+    ? {
+        username: username.trim(),
+        password: (password ?? "").trim(),
+      }
+    : {};
+
+  // Headers
+  const headers = [
+    ...((flagsByName.header as string[] | undefined) || []),
+    ...((flagsByName.H as string[] | undefined) || []),
+  ].map((header) => {
+    const [name, value] = header.split(/:(.*)$/);
+    // remove final colon from header name if present
+    if (!value) {
+      return {
+        name: (name ?? "").trim().replace(/;$/, ""),
+        value: "",
+        enabled: true,
+      };
+    }
+    return {
+      name: (name ?? "").trim(),
+      value: value.trim(),
+      enabled: true,
+    };
+  });
+
+  // Cookies
+  const cookieHeaderValue = [
+    ...((flagsByName.cookie as string[] | undefined) || []),
+    ...((flagsByName.b as string[] | undefined) || []),
+  ]
+    .map((str) => {
+      const name = str.split("=", 1)[0];
+      const value = str.replace(`${name}=`, "");
+      return `${name}=${value}`;
+    })
+    .join("; ");
+
+  // Convert cookie value to header
+  const existingCookieHeader = headers.find((header) => header.name.toLowerCase() === "cookie");
+
+  if (cookieHeaderValue && existingCookieHeader) {
+    // Has existing cookie header, so let's update it
+    existingCookieHeader.value += `; ${cookieHeaderValue}`;
+  } else if (cookieHeaderValue) {
+    // No existing cookie header, so let's make a new one
+    headers.push({
+      name: "Cookie",
+      value: cookieHeaderValue,
+      enabled: true,
+    });
+  }
+
+  // Extract authentication from Authorization headers (Bearer/Basic)
+  const {
+    authenticationType: extractedAuthenticationType,
+    authentication: extractedAuthentication,
+    filteredHeaders,
+  } = extractAuthenticationFromHeaders(headers);
+
+  // Use extracted authentication from header if found, otherwise fall back to -u/--user parsing
+  const finalAuthenticationType = extractedAuthenticationType || authenticationType;
+  const finalAuthentication = extractedAuthenticationType
+    ? extractedAuthentication
+    : authentication;
+
+  // Body (Text or Blob)
+  const contentTypeHeader = filteredHeaders.find(
+    (header) => header.name.toLowerCase() === "content-type",
+  );
+  const mimeType = contentTypeHeader ? contentTypeHeader.value.split(";")[0]?.trim() : null;
+
+  // Extract boundary from Content-Type header for multipart parsing
+  const boundaryMatch = contentTypeHeader?.value.match(/boundary=([^\s;]+)/i);
+  const boundary = boundaryMatch?.[1];
+
+  // Get raw data from --data-raw flags (before splitting by &)
+  const rawDataValues = [
+    ...((flagsByName["data-raw"] as string[] | undefined) || []),
+    ...((flagsByName.d as string[] | undefined) || []),
+    ...((flagsByName.data as string[] | undefined) || []),
+    ...((flagsByName["data-binary"] as string[] | undefined) || []),
+    ...((flagsByName["data-ascii"] as string[] | undefined) || []),
+  ];
+
+  // Check if this is multipart form data in --data-raw (Chrome DevTools format)
+  let multipartFormDataFromRaw:
+    | { name: string; value?: string; file?: string; enabled: boolean }[]
+    | null = null;
+  if (mimeType === "multipart/form-data" && boundary && rawDataValues.length > 0) {
+    const rawBody = rawDataValues.join("");
+    multipartFormDataFromRaw = parseMultipartFormData(rawBody, boundary);
+  }
+
+  const dataParameters = pairsToDataParameters(flagsByName);
+
+  // Body (Multipart Form Data from -F flags)
+  const formDataParams = [
+    ...((flagsByName.form as string[] | undefined) || []),
+    ...((flagsByName.F as string[] | undefined) || []),
+  ].map((str) => {
+    // splitOnce for the same reason as --url-query above: base64 padding
+    // ("...==") and any value containing "=" must survive intact.
+    const parts = splitOnce(str, "=");
+    const name = parts[0] ?? "";
+    const value = parts[1] ?? "";
+    const item: { name: string; value?: string; file?: string; enabled: boolean } = {
+      name,
+      enabled: true,
+    };
+
+    if (value.indexOf("@") === 0) {
+      item.file = value.slice(1);
+    } else {
+      item.value = value;
+    }
+
+    return item;
+  });
+
+  // Body
+  let body = {};
+  let bodyType: string | null = null;
+  const bodyAsGET = getPairValue(flagsByName, false, ["G", "get"]);
+  const hasDataBody = dataParameters.length > 0 && !bodyAsGET;
+  const hasFormBody = multipartFormDataFromRaw != null || formDataParams.length > 0;
+
+  if (multipartFormDataFromRaw) {
+    // Handle multipart form data parsed from --data-raw (Chrome DevTools format)
+    bodyType = "multipart/form-data";
+    body = {
+      form: multipartFormDataFromRaw,
+    };
+  } else if (dataParameters.length > 0 && bodyAsGET) {
+    // `-G` moves the data into the query string, and Yaak encodes url
+    // parameters on send exactly as it encodes the form body below, so this
+    // needs the same decode -- otherwise a `--data-urlencode` value arrives
+    // here already encoded and goes out encoded twice.
+    urlParameters.push(
+      ...dataParameters.map((parameter) => ({
+        ...parameter,
+        name: decodePercentEncoding(parameter.name),
+        value: decodePercentEncoding(parameter.value),
+      })),
+    );
+  } else if (
+    dataParameters.length > 0 &&
+    (mimeType == null || mimeType === "application/x-www-form-urlencoded")
+  ) {
+    bodyType = mimeType ?? "application/x-www-form-urlencoded";
+    body = {
+      form: dataParameters.map((parameter) => ({
+        ...parameter,
+        name: decodePercentEncoding(parameter.name),
+        value: decodePercentEncoding(parameter.value),
+      })),
+    };
+    filteredHeaders.push({
+      name: "Content-Type",
+      value: "application/x-www-form-urlencoded",
+      enabled: true,
+    });
+  } else if (dataParameters.length > 0) {
+    const text = dataParameters
+      .map(({ name, value }) => (name && value ? `${name}=${value}` : name || value))
+      .join("&");
+    const graphqlBody = parseGraphQLJsonBody({ mimeType, text, url });
+
+    if (graphqlBody != null) {
+      bodyType = "graphql";
+      body = graphqlBody;
+    } else if (
+      mimeType === "application/json" ||
+      mimeType === "text/xml" ||
+      mimeType === "text/plain"
+    ) {
+      bodyType = mimeType;
+      body = { text };
+    } else {
+      bodyType = "other";
+      body = { text };
+    }
+  } else if (formDataParams.length) {
+    bodyType = mimeType ?? "multipart/form-data";
+    body = {
+      form: formDataParams,
+    };
+    if (mimeType == null) {
+      filteredHeaders.push({
+        name: "Content-Type",
+        value: "multipart/form-data",
+        enabled: true,
+      });
+    }
+  }
+
+  // Method
+  let method = getPairValue(flagsByName, "", ["X", "request"]).toUpperCase();
+
+  if (method === "") {
+    method = hasDataBody || hasFormBody ? "POST" : "GET";
+  }
+
+  const request: ExportResources["httpRequests"][0] = {
+    id: generateId("http_request"),
+    model: "http_request",
+    workspaceId,
+    name: "",
+    urlParameters,
+    url,
+    method,
+    headers: filteredHeaders,
+    authentication: finalAuthentication,
+    authenticationType: finalAuthenticationType,
+    body,
+    bodyType,
+    folderId: null,
+    sortPriority: 0,
+  };
+
+  return request;
+}
+
+interface DataParameter {
+  name: string;
+  value: string;
+  contentType?: string;
+  filePath?: string;
+  enabled?: boolean;
+}
+
+/**
+ * Decode a percent-encoded form value, keeping it as-is when it is not one.
+ *
+ * Yaak's form editor holds decoded values and re-encodes them on send, so a
+ * `-d` value has to be decoded on the way in. But curl sends that value
+ * verbatim and does not require it to be valid percent-encoding: `a=100%` is
+ * an ordinary form value, and `decodeURIComponent` throws URIError on it,
+ * which failed the whole import rather than that one parameter.
+ */
+function decodePercentEncoding(value: string | undefined): string {
+  const text = value || "";
+  try {
+    return decodeURIComponent(text);
+  } catch {
+    // Mixed: some of it is percent-encoded and some of it is a stray `%`.
+    // Returning the whole string untouched would leave the encoded part to be
+    // encoded a second time on send, so decode each valid run on its own and
+    // leave the stray byte alone. A run rather than a single escape, because a
+    // non-ASCII character is several escapes that only decode together.
+    return text.replace(/(%[0-9A-Fa-f]{2})+/g, (run) => {
+      try {
+        return decodeURIComponent(run);
+      } catch {
+        return run;
+      }
+    });
+  }
+}
+function pairsToDataParameters(keyedPairs: FlagsByName): DataParameter[] {
+  const dataParameters: DataParameter[] = [];
+
+  for (const flagName of DATA_FLAGS) {
+    const pairs = keyedPairs[flagName];
+
+    if (!pairs || pairs.length === 0) {
+      continue;
+    }
+
+    for (const p of pairs) {
+      if (typeof p !== "string") continue;
+      // `-d` content really is `&`-separated, so splitting it is right. But
+      // `--data-urlencode` encodes its whole argument — an `&` inside it is
+      // data curl percent-encodes, not a separator, so splitting there turned
+      // one parameter into several and changed what the request sends.
+      const params = flagName === "data-urlencode" ? [p] : p.split("&");
+      for (const param of params) {
+        const [name, value] = splitOnce(param, "=");
+        if (param.startsWith("@")) {
+          // Yaak doesn't support files in url-encoded data, so
+          dataParameters.push({
+            name: name ?? "",
+            value: "",
+            filePath: param.slice(1),
+            enabled: true,
+          });
+        } else {
+          dataParameters.push({
+            name: name ?? "",
+            value: flagName === "data-urlencode" ? encodeURIComponent(value ?? "") : (value ?? ""),
+            enabled: true,
+          });
+        }
+      }
+    }
+  }
+
+  return dataParameters;
+}
+
+const getPairValue = <T extends string | boolean>(
+  pairsByName: FlagsByName,
+  defaultValue: T,
+  names: string[],
+) => {
+  for (const name of names) {
+    if (pairsByName[name]?.length) {
+      return pairsByName[name]?.[0] as T;
+    }
+  }
+
+  return defaultValue;
+};
+
+function splitOnce(str: string, sep: string): string[] {
+  const index = str.indexOf(sep);
+  if (index > -1) {
+    return [str.slice(0, index), str.slice(index + 1)];
+  }
+  return [str];
+}
+
+/**
+ * Parses multipart form data from a raw body string
+ * Used when Chrome DevTools exports a cURL with --data-raw containing multipart data
+ */
+function parseMultipartFormData(
+  rawBody: string,
+  boundary: string,
+): { name: string; value?: string; file?: string; enabled: boolean }[] | null {
+  const results: { name: string; value?: string; file?: string; enabled: boolean }[] = [];
+
+  // The boundary in the body typically has -- prefix
+  const boundaryMarker = `--${boundary}`;
+  const parts = rawBody.split(boundaryMarker);
+
+  for (const part of parts) {
+    // Skip empty parts and the closing boundary marker
+    if (!part || part.trim() === "--" || part.trim() === "--\r\n") {
+      continue;
+    }
+
+    // Each part has headers and content separated by \r\n\r\n
+    const headerContentSplit = part.indexOf("\r\n\r\n");
+    if (headerContentSplit === -1) {
+      continue;
+    }
+
+    const headerSection = part.slice(0, headerContentSplit);
+    let content = part.slice(headerContentSplit + 4); // Skip \r\n\r\n
+
+    // Remove trailing \r\n from content
+    if (content.endsWith("\r\n")) {
+      content = content.slice(0, -2);
+    }
+
+    // Parse Content-Disposition header to get name and filename
+    const contentDispositionMatch = headerSection.match(
+      /Content-Disposition:\s*form-data;\s*name="([^"]+)"(?:;\s*filename="([^"]+)")?/i,
+    );
+
+    if (!contentDispositionMatch) {
+      continue;
+    }
+
+    const name = contentDispositionMatch[1] ?? "";
+    const filename = contentDispositionMatch[2];
+
+    const item: { name: string; value?: string; file?: string; enabled: boolean } = {
+      name,
+      enabled: true,
+    };
+
+    if (filename) {
+      // This is a file upload field
+      item.file = filename;
+    } else {
+      // This is a regular text field
+      item.value = content;
+    }
+
+    results.push(item);
+  }
+
+  return results.length > 0 ? results : null;
+}
+
+const idCount: Partial<Record<string, number>> = {};
+
+function generateId(model: string): string {
+  idCount[model] = (idCount[model] ?? -1) + 1;
+  return `GENERATE_ID::${model.toUpperCase()}_${idCount[model]}`;
+}

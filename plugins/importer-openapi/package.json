@@ -1,0 +1,16 @@
+{
+  "name": "@yaak/importer-openapi",
+  "displayName": "OpenAPI Importer",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Import API specifications from OpenAPI/Swagger format",
+  "scripts": {
+    "build": "yaakcli build",
+    "dev": "yaakcli dev",
+    "test": "vp test --run tests",
+    "test:roundtrip": "node tests/roundtrip.mjs"
+  },
+  "dependencies": {
+    "yaml": "^2.8.3"
+  }
+}

@@ -1,0 +1,29 @@
+[package]
+name = "yaak-models"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+chrono = { version = "0.4.38", features = ["serde"] }
+yaak-database = { workspace = true }
+hex = { workspace = true }
+include_dir = "0.7"
+log = { workspace = true }
+nanoid = "0.4.0"
+rusqlite = { version = "0.38", features = ["bundled", "chrono"] }
+sea-query = { version = "1.0", features = ["with-chrono", "attr"] }
+sea-query-rusqlite = { version = "0.8.0", features = ["with-chrono"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+schemars = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+urlencoding = "2.1.3"
+ts-rs = { workspace = true, features = ["chrono-impl", "serde-json-impl"] }
+yaak-core = { workspace = true }
+yaak-templates = { path = "../yaak-templates", default-features = false }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+r2d2 = "0.8.10"
+r2d2_sqlite = { version = "0.32" }

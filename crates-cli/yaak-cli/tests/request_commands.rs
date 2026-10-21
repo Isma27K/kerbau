@@ -1,0 +1,291 @@
+mod common;
+
+use common::http_server::TestHttpServer;
+use common::{
+    cli_cmd, parse_created_id, query_manager, seed_grpc_request, seed_request,
+    seed_websocket_request, seed_workspace,
+};
+use predicates::str::contains;
+use tempfile::TempDir;
+use yaak_models::models::HttpResponseState;
+
+#[test]
+fn show_and_delete_yes_round_trip() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let data_dir = temp_dir.path();
+    seed_workspace(data_dir, "wk_test");
+
+    let create_assert = cli_cmd(data_dir)
+        .args([
+            "request",
+            "create",
+            "wk_test",
+            "--name",
+            "Smoke Test",
+            "--url",
+            "https://example.com",
+        ])
+        .assert()
+        .success();
+
+    let request_id = parse_created_id(&create_assert.get_output().stdout, "request create");
+
+    cli_cmd(data_dir)
+        .args(["request", "show", &request_id])
+        .assert()
+        .success()
+        .stdout(contains(format!("\"id\": \"{request_id}\"")))
+        .stdout(contains("\"workspaceId\": \"wk_test\""));
+
+    cli_cmd(data_dir)
+        .args(["request", "delete", &request_id, "--yes"])
+        .assert()
+        .success()
+        .stdout(contains(format!("Deleted request: {request_id}")));
+
+    assert!(query_manager(data_dir).connect().get_http_request(&request_id).is_err());
+}
+
+#[test]
+fn delete_without_yes_fails_in_non_interactive_mode() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let data_dir = temp_dir.path();
+    seed_workspace(data_dir, "wk_test");
+    seed_request(data_dir, "wk_test", "rq_seed_delete_noninteractive");
+
+    cli_cmd(data_dir)
+        .args(["request", "delete", "rq_seed_delete_noninteractive"])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(contains("Refusing to delete in non-interactive mode without --yes"));
+
+    assert!(
+        query_manager(data_dir).connect().get_http_request("rq_seed_delete_noninteractive").is_ok()
+    );
+}
+
+#[test]
+fn json_create_and_update_merge_patch_round_trip() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let data_dir = temp_dir.path();
+    seed_workspace(data_dir, "wk_test");
+
+    let create_assert = cli_cmd(data_dir)
+        .args([
+            "request",
+            "create",
+            r#"{"workspaceId":"wk_test","name":"Json Request","url":"https://example.com"}"#,
+        ])
+        .assert()
+        .success();
+    let request_id = parse_created_id(&create_assert.get_output().stdout, "request create");
+
+    cli_cmd(data_dir)
+        .args([
+            "request",
+            "update",
+            &format!(r#"{{"id":"{}","name":"Renamed Request"}}"#, request_id),
+        ])
+        .assert()
+        .success()
+        .stdout(contains(format!("Updated request: {request_id}")));
+
+    cli_cmd(data_dir)
+        .args(["request", "show", &request_id])
+        .assert()
+        .success()
+        .stdout(contains("\"name\": \"Renamed Request\""))
+        .stdout(contains("\"url\": \"https://example.com\""));
+}
+
+#[test]
+fn update_requires_id_in_json_payload() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let data_dir = temp_dir.path();
+
+    cli_cmd(data_dir)
+        .args(["request", "update", r#"{"name":"No ID"}"#])
+        .assert()
+        .failure()
+        .stderr(contains("request update requires a non-empty \"id\" field"));
+}
+
+#[test]
+fn create_allows_workspace_only_with_empty_defaults() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let data_dir = temp_dir.path();
+    seed_workspace(data_dir, "wk_test");
+
+    let create_assert = cli_cmd(data_dir).args(["request", "create", "wk_test"]).assert().success();
+    let request_id = parse_created_id(&create_assert.get_output().stdout, "request create");
+
+    let request = query_manager(data_dir)
+        .connect()
+        .get_http_request(&request_id)
+        .expect("Failed to load created request");
+    assert_eq!(request.workspace_id, "wk_test");
+    assert_eq!(request.method, "GET");
+    assert_eq!(request.name, "");
+    assert_eq!(request.url, "");
+}
+
+#[test]
+fn create_merges_positional_workspace_id_into_json_payload() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let data_dir = temp_dir.path();
+    seed_workspace(data_dir, "wk_test");
+
+    let create_assert = cli_cmd(data_dir)
+        .args([
+            "request",
+            "create",
+            "wk_test",
+            "--json",
+            r#"{"name":"Merged Request","url":"https://example.com"}"#,
+        ])
+        .assert()
+        .success();
+    let request_id = parse_created_id(&create_assert.get_output().stdout, "request create");
+
+    cli_cmd(data_dir)
+        .args(["request", "show", &request_id])
+        .assert()
+        .success()
+        .stdout(contains("\"workspaceId\": \"wk_test\""))
+        .stdout(contains("\"name\": \"Merged Request\""));
+}
+
+#[test]
+fn create_rejects_conflicting_workspace_ids_between_arg_and_json() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let data_dir = temp_dir.path();
+    seed_workspace(data_dir, "wk_test");
+    seed_workspace(data_dir, "wk_other");
+
+    cli_cmd(data_dir)
+        .args([
+            "request",
+            "create",
+            "wk_test",
+            "--json",
+            r#"{"workspaceId":"wk_other","name":"Mismatch"}"#,
+        ])
+        .assert()
+        .failure()
+        .stderr(contains(
+            "request create got conflicting workspace_id values between positional arg and JSON payload",
+        ));
+}
+
+#[test]
+fn request_send_persists_response_body_and_events() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let data_dir = temp_dir.path();
+    seed_workspace(data_dir, "wk_test");
+
+    let server = TestHttpServer::spawn_ok("hello from integration test");
+
+    let create_assert = cli_cmd(data_dir)
+        .args([
+            "request",
+            "create",
+            "wk_test",
+            "--name",
+            "Send Test",
+            "--url",
+            &server.url,
+        ])
+        .assert()
+        .success();
+    let request_id = parse_created_id(&create_assert.get_output().stdout, "request create");
+
+    cli_cmd(data_dir)
+        .args(["request", "send", &request_id])
+        .assert()
+        .success()
+        .stdout(contains("hello from integration test"));
+
+    let qm = query_manager(data_dir);
+    let db = qm.connect();
+    let responses =
+        db.list_http_responses_for_request(&request_id, None).expect("Failed to load responses");
+    assert_eq!(responses.len(), 1, "expected exactly one persisted response");
+
+    let response = &responses[0];
+    assert_eq!(response.status, 200);
+    assert!(matches!(response.state, HttpResponseState::Closed));
+    assert!(response.error.is_none());
+
+    let body_path =
+        response.body_path.as_ref().expect("expected persisted response body path").to_string();
+    let body = std::fs::read_to_string(&body_path).expect("Failed to read response body file");
+    assert_eq!(body, "hello from integration test");
+
+    let events =
+        db.list_http_response_events(&response.id).expect("Failed to load response events");
+    assert!(!events.is_empty(), "expected at least one persisted response event");
+}
+
+#[test]
+fn request_schema_http_outputs_json_schema() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let data_dir = temp_dir.path();
+
+    cli_cmd(data_dir)
+        .args(["request", "schema", "http"])
+        .assert()
+        .success()
+        .stdout(contains("\"type\":\"object\""))
+        .stdout(contains("\"x-yaak-agent-hints\""))
+        .stdout(contains("\"templateVariableSyntax\":\"${[ my_var ]}\""))
+        .stdout(contains(
+            "\"templateFunctionSyntax\":\"${[ namespace.my_func(a='aaa',b='bbb') ]}\"",
+        ))
+        .stdout(contains("\"authentication\":"))
+        .stdout(contains("/foo/:id/comments/:commentId"))
+        .stdout(contains("put concrete values in `urlParameters`"));
+}
+
+#[test]
+fn request_schema_http_pretty_prints_with_flag() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let data_dir = temp_dir.path();
+
+    cli_cmd(data_dir)
+        .args(["request", "schema", "http", "--pretty"])
+        .assert()
+        .success()
+        .stdout(contains("\"type\": \"object\""))
+        .stdout(contains("\"authentication\""));
+}
+
+#[test]
+fn request_send_grpc_returns_explicit_nyi_error() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let data_dir = temp_dir.path();
+    seed_workspace(data_dir, "wk_test");
+    seed_grpc_request(data_dir, "wk_test", "gr_seed_nyi");
+
+    cli_cmd(data_dir)
+        .args(["request", "send", "gr_seed_nyi"])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(contains("gRPC request send is not implemented yet in yaak-cli"));
+}
+
+#[test]
+fn request_send_websocket_returns_explicit_nyi_error() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let data_dir = temp_dir.path();
+    seed_workspace(data_dir, "wk_test");
+    seed_websocket_request(data_dir, "wk_test", "wr_seed_nyi");
+
+    cli_cmd(data_dir)
+        .args(["request", "send", "wr_seed_nyi"])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(contains("WebSocket request send is not implemented yet in yaak-cli"));
+}

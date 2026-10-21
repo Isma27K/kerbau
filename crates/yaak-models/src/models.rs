@@ -1,0 +1,3362 @@
+use crate::error::Result;
+use crate::models::HttpRequestIden::{
+    Authentication, AuthenticationType, Body, BodyType, CreatedAt, Description, FolderId, Headers,
+    Method, Name, SettingFollowRedirects, SettingHttpVersion, SettingRequestTimeout,
+    SettingSendCookies, SettingStoreCookies, SettingValidateCertificates, SortPriority, UpdatedAt,
+    Url, UrlParameters, WorkspaceId,
+};
+use crate::util::generate_prefixed_id;
+use chrono::{NaiveDateTime, Utc};
+use rusqlite::Row;
+use schemars::JsonSchema;
+use sea_query::Order::Desc;
+use sea_query::{IntoColumnRef, IntoIden, IntoTableRef, Order, SimpleExpr, enum_def};
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::Value;
+use std::collections::BTreeMap;
+use std::collections::HashMap;
+use std::fmt::{Debug, Display};
+use std::str::FromStr;
+use ts_rs::TS;
+use yaak_database::{Result as DbResult, UpdateSource};
+pub use yaak_database::{UpsertModelInfo, upsert_date};
+
+pub const DEFAULT_REQUEST_MESSAGE_SIZE: i32 = 64 * 1024 * 1024;
+
+#[macro_export]
+macro_rules! impl_model {
+    ($t:ty, $variant:ident) => {
+        impl $crate::Model for $t {
+            fn into_any(self) -> $crate::AnyModel {
+                $crate::AnyModel::$variant(self)
+            }
+        }
+    };
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", tag = "type")]
+#[ts(export, export_to = "gen_models.ts")]
+pub enum ProxySetting {
+    Enabled {
+        http: String,
+        https: String,
+        auth: Option<ProxySettingAuth>,
+
+        // These were added later, so give them defaults
+        #[serde(default)]
+        bypass: String,
+        #[serde(default)]
+        disabled: bool,
+    },
+    Disabled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "gen_models.ts")]
+pub struct ProxySettingAuth {
+    pub user: String,
+    pub password: String,
+}
+
+impl Default for ClientCertificate {
+    fn default() -> Self {
+        Self {
+            host: String::new(),
+            port: None,
+            crt_file: None,
+            key_file: None,
+            pfx_file: None,
+            passphrase: None,
+            enabled: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(default, rename_all = "camelCase")]
+#[ts(export, export_to = "gen_models.ts")]
+pub struct ClientCertificate {
+    pub host: String,
+    #[serde(default)]
+    pub port: Option<i32>,
+    #[serde(default)]
+    pub crt_file: Option<String>,
+    #[serde(default)]
+    pub key_file: Option<String>,
+    #[serde(default)]
+    pub pfx_file: Option<String>,
+    #[serde(default)]
+    pub passphrase: Option<String>,
+    #[ts(optional, as = "Option<bool>")]
+    pub enabled: bool,
+}
+
+impl Default for DnsOverride {
+    fn default() -> Self {
+        Self { hostname: String::new(), ipv4: Vec::new(), ipv6: Vec::new(), enabled: true }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(default, rename_all = "camelCase")]
+#[ts(export, export_to = "gen_models.ts")]
+pub struct DnsOverride {
+    pub hostname: String,
+    #[serde(default)]
+    pub ipv4: Vec<String>,
+    #[serde(default)]
+    pub ipv6: Vec<String>,
+    #[ts(optional, as = "Option<bool>")]
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ResolvedSetting<T> {
+    pub value: T,
+    pub source_model: String,
+    pub source_id: Option<String>,
+    pub source_name: Option<String>,
+}
+
+impl<T> ResolvedSetting<T> {
+    pub fn from_model(value: T, model: AnyModel) -> Self {
+        Self {
+            value,
+            source_model: model.model().to_string(),
+            source_id: Some(model.id().to_string()),
+            source_name: Some(model.resolved_name()),
+        }
+    }
+
+    pub fn default_source(value: T) -> Self {
+        Self { value, source_model: "default".to_string(), source_id: None, source_name: None }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedHttpRequestSettings {
+    pub validate_certificates: ResolvedSetting<bool>,
+    pub follow_redirects: ResolvedSetting<bool>,
+    pub request_timeout: ResolvedSetting<i32>,
+    pub request_message_size: ResolvedSetting<i32>,
+    pub send_cookies: ResolvedSetting<bool>,
+    pub store_cookies: ResolvedSetting<bool>,
+    pub http_version: ResolvedSetting<HttpVersion>,
+}
+
+impl Default for ResolvedHttpRequestSettings {
+    fn default() -> Self {
+        Self {
+            validate_certificates: ResolvedSetting::default_source(true),
+            follow_redirects: ResolvedSetting::default_source(true),
+            request_timeout: ResolvedSetting::default_source(0),
+            request_message_size: ResolvedSetting::default_source(DEFAULT_REQUEST_MESSAGE_SIZE),
+            send_cookies: ResolvedSetting::default_source(true),
+            store_cookies: ResolvedSetting::default_source(true),
+            http_version: ResolvedSetting::default_source(HttpVersion::Auto),
+        }
+    }
+}
+
+impl ResolvedHttpRequestSettings {
+    /// The `* Setting name=value` lines a send writes at the top of its timeline, sources and
+    /// all. Built here, once, so every host that runs a send — the desktop, the CLI, the browser
+    /// tab handing off to a proxy — records the same lines the same way.
+    pub fn timeline_events(&self) -> Vec<HttpResponseEventData> {
+        fn event<T>(
+            name: &str,
+            value: String,
+            setting: &ResolvedSetting<T>,
+        ) -> HttpResponseEventData {
+            HttpResponseEventData::Setting {
+                name: name.to_string(),
+                value,
+                source_model: Some(setting.source_model.clone()),
+                source_id: setting.source_id.clone(),
+                source_name: setting.source_name.clone(),
+            }
+        }
+        let timeout = if self.request_timeout.value > 0 {
+            format!("{:?}", std::time::Duration::from_millis(self.request_timeout.value as u64))
+        } else {
+            "Infinity".to_string()
+        };
+        vec![
+            event(
+                "validate_certificates",
+                self.validate_certificates.value.to_string(),
+                &self.validate_certificates,
+            ),
+            event("redirects", self.follow_redirects.value.to_string(), &self.follow_redirects),
+            event("timeout", timeout, &self.request_timeout),
+            event("send_cookies", self.send_cookies.value.to_string(), &self.send_cookies),
+            event("store_cookies", self.store_cookies.value.to_string(), &self.store_cookies),
+            event("http_version", self.http_version.value.to_string(), &self.http_version),
+        ]
+    }
+}
+
+/// The resolved send settings, values only: what an executor has to obey, with the sources
+/// (which model each came from) left behind in [`ResolvedHttpRequestSettings`]. This is what
+/// crosses from a tab to the Yaak server, and what the server reads.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "gen_models.ts")]
+pub struct HttpSendSettings {
+    pub validate_certificates: bool,
+    pub follow_redirects: bool,
+    /// Milliseconds. Zero or negative means no timeout.
+    pub timeout_ms: i32,
+    pub send_cookies: bool,
+    pub store_cookies: bool,
+    #[serde(default)]
+    pub http_version: HttpVersion,
+}
+
+impl From<&ResolvedHttpRequestSettings> for HttpSendSettings {
+    fn from(s: &ResolvedHttpRequestSettings) -> Self {
+        Self {
+            validate_certificates: s.validate_certificates.value,
+            follow_redirects: s.follow_redirects.value,
+            timeout_ms: s.request_timeout.value,
+            send_cookies: s.send_cookies.value,
+            store_cookies: s.store_cookies.value,
+            http_version: s.http_version.value,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(default, rename_all = "camelCase")]
+#[ts(export, export_to = "gen_models.ts")]
+pub struct InheritedBoolSetting {
+    #[serde(default)]
+    #[ts(optional, as = "Option<bool>")]
+    pub enabled: bool,
+    pub value: bool,
+}
+
+impl Default for InheritedBoolSetting {
+    fn default() -> Self {
+        Self { enabled: false, value: true }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(default, rename_all = "camelCase")]
+#[ts(export, export_to = "gen_models.ts")]
+pub struct InheritedIntSetting {
+    #[serde(default)]
+    #[ts(optional, as = "Option<bool>")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub value: i32,
+}
+
+impl Default for InheritedIntSetting {
+    fn default() -> Self {
+        Self { enabled: false, value: 0 }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "gen_models.ts")]
+pub enum HttpVersion {
+    #[default]
+    Auto,
+    Http1,
+    Http2,
+}
+
+impl FromStr for HttpVersion {
+    type Err = crate::error::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "http1" => Ok(Self::Http1),
+            "http2" => Ok(Self::Http2),
+            _ => Ok(Self::Auto),
+        }
+    }
+}
+
+impl Display for HttpVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let str = match self {
+            HttpVersion::Auto => "auto",
+            HttpVersion::Http1 => "http1",
+            HttpVersion::Http2 => "http2",
+        };
+        write!(f, "{}", str)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(default, rename_all = "camelCase")]
+#[ts(export, export_to = "gen_models.ts")]
+pub struct InheritedHttpVersionSetting {
+    #[serde(default)]
+    #[ts(optional, as = "Option<bool>")]
+    pub enabled: bool,
+    pub value: HttpVersion,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "gen_models.ts")]
+pub enum EditorKeymap {
+    Default,
+    Vim,
+    Vscode,
+    Emacs,
+}
+
+impl FromStr for EditorKeymap {
+    type Err = crate::error::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "default" => Ok(Self::Default),
+            "vscode" => Ok(Self::Vscode),
+            "vim" => Ok(Self::Vim),
+            "emacs" => Ok(Self::Emacs),
+            _ => Ok(Self::default()),
+        }
+    }
+}
+
+impl Display for EditorKeymap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let str = match self {
+            EditorKeymap::Default => "default".to_string(),
+            EditorKeymap::Vscode => "vscode".to_string(),
+            EditorKeymap::Vim => "vim".to_string(),
+            EditorKeymap::Emacs => "emacs".to_string(),
+        };
+        write!(f, "{}", str)
+    }
+}
+
+impl Default for EditorKeymap {
+    fn default() -> Self {
+        Self::Default
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, TS)]
+#[serde(default, rename_all = "camelCase")]
+#[ts(export, export_to = "gen_models.ts")]
+#[enum_def(table_name = "settings")]
+pub struct Settings {
+    #[ts(type = "\"settings\"")]
+    pub model: String,
+    pub id: String,
+    pub created_at: NaiveDateTime,
+    pub updated_at: NaiveDateTime,
+
+    pub appearance: String,
+    pub client_certificates: Vec<ClientCertificate>,
+    pub colored_methods: bool,
+    pub editor_font: Option<String>,
+    pub editor_font_size: i32,
+    pub editor_keymap: EditorKeymap,
+    pub editor_soft_wrap: bool,
+    pub hide_window_controls: bool,
+    // When true (primarily on Windows/Linux), use the native OS window title bar and controls
+    pub use_native_titlebar: bool,
+    pub interface_font: Option<String>,
+    pub interface_font_size: i32,
+    pub interface_scale: f32,
+    pub open_workspace_new_window: Option<bool>,
+    pub proxy: Option<ProxySetting>,
+    pub theme_dark: String,
+    pub theme_light: String,
+    pub update_channel: String,
+    pub hide_license_badge: bool,
+    pub prompt_feedback: bool,
+    pub mcp_server_enabled: bool,
+    pub autoupdate: bool,
+    pub auto_download_updates: bool,
+    pub check_notifications: bool,
+    pub hotkeys: HashMap<String, Vec<String>>,
+}
+
+impl UpsertModelInfo for Settings {
+    fn table_name() -> impl IntoTableRef + IntoIden {
+        SettingsIden::Table
+    }
+
+    fn id_column() -> impl IntoIden + Eq + Clone {
+        SettingsIden::Id
+    }
+
+    fn generate_id() -> String {
+        panic!("Settings does not have unique IDs")
+    }
+
+    fn order_by() -> (impl IntoColumnRef, Order) {
+        (SettingsIden::CreatedAt, Desc)
+    }
+
+    fn get_id(&self) -> String {
+        self.id.clone()
+    }
+
+    fn insert_values(
+        self,
+        source: &UpdateSource,
+    ) -> DbResult<Vec<(impl IntoIden + Eq, impl Into<SimpleExpr>)>> {
+        use SettingsIden::*;
+        let proxy = match self.proxy {
+            None => None,
+            Some(p) => Some(serde_json::to_string(&p)?),
+        };
+        let client_certificates = serde_json::to_string(&self.client_certificates)?;
+        let hotkeys = serde_json::to_string(&self.hotkeys)?;
+        Ok(vec![
+            (CreatedAt, upsert_date(source, self.created_at)),
+            (UpdatedAt, upsert_date(source, self.updated_at)),
+            (Appearance, self.appearance.as_str().into()),
+            (ClientCertificates, client_certificates.into()),
+            (EditorFontSize, self.editor_font_size.into()),
+            (EditorKeymap, self.editor_keymap.to_string().into()),
+            (EditorSoftWrap, self.editor_soft_wrap.into()),
+            (EditorFont, self.editor_font.into()),
+            (InterfaceFont, self.interface_font.into()),
+            (InterfaceFontSize, self.interface_font_size.into()),
+            (InterfaceScale, self.interface_scale.into()),
+            (HideWindowControls, self.hide_window_controls.into()),
+            (UseNativeTitlebar, self.use_native_titlebar.into()),
+            (OpenWorkspaceNewWindow, self.open_workspace_new_window.into()),
+            (ThemeDark, self.theme_dark.as_str().into()),
+            (ThemeLight, self.theme_light.as_str().into()),
+            (UpdateChannel, self.update_channel.into()),
+            (HideLicenseBadge, self.hide_license_badge.into()),
+            (PromptFeedback, self.prompt_feedback.into()),
+            (McpServerEnabled, self.mcp_server_enabled.into()),
+            (Autoupdate, self.autoupdate.into()),
+            (AutoDownloadUpdates, self.auto_download_updates.into()),
+            (ColoredMethods, self.colored_methods.into()),
+            (CheckNotifications, self.check_notifications.into()),
+            (Proxy, proxy.into()),
+            (Hotkeys, hotkeys.into()),
+        ])
+    }
+
+    fn update_columns() -> Vec<impl IntoIden> {
+        vec![
+            SettingsIden::UpdatedAt,
+            SettingsIden::Appearance,
+            SettingsIden::ClientCertificates,
+            SettingsIden::EditorFontSize,
+            SettingsIden::EditorKeymap,
+            SettingsIden::EditorSoftWrap,
+            SettingsIden::EditorFont,
+            SettingsIden::InterfaceFontSize,
+            SettingsIden::InterfaceScale,
+            SettingsIden::InterfaceFont,
+            SettingsIden::HideWindowControls,
+            SettingsIden::UseNativeTitlebar,
+            SettingsIden::OpenWorkspaceNewWindow,
+            SettingsIden::Proxy,
+            SettingsIden::ThemeDark,
+            SettingsIden::ThemeLight,
+            SettingsIden::UpdateChannel,
+            SettingsIden::HideLicenseBadge,
+            SettingsIden::PromptFeedback,
+            SettingsIden::McpServerEnabled,
+            SettingsIden::Autoupdate,
+            SettingsIden::AutoDownloadUpdates,
+            SettingsIden::ColoredMethods,
+            SettingsIden::CheckNotifications,
+            SettingsIden::Hotkeys,
+        ]
+    }
+
+    fn from_row(row: &Row) -> rusqlite::Result<Self>
+    where
+        Self: Sized,
+    {
+        let proxy: Option<String> = row.get("proxy")?;
+        let client_certificates: String = row.get("client_certificates")?;
+        let editor_keymap: String = row.get("editor_keymap")?;
+        let hotkeys: String = row.get("hotkeys")?;
+        Ok(Self {
+            id: row.get("id")?,
+            model: row.get("model")?,
+            created_at: row.get("created_at")?,
+            updated_at: row.get("updated_at")?,
+            appearance: row.get("appearance")?,
+            client_certificates: serde_json::from_str(&client_certificates).unwrap_or_default(),
+            editor_font_size: row.get("editor_font_size")?,
+            editor_font: row.get("editor_font")?,
+            editor_keymap: EditorKeymap::from_str(editor_keymap.as_str()).unwrap(),
+            editor_soft_wrap: row.get("editor_soft_wrap")?,
+            interface_font_size: row.get("interface_font_size")?,
+            interface_scale: row.get("interface_scale")?,
+            interface_font: row.get("interface_font")?,
+            use_native_titlebar: row.get("use_native_titlebar")?,
+            open_workspace_new_window: row.get("open_workspace_new_window")?,
+            proxy: proxy.map(|p| -> ProxySetting { serde_json::from_str(p.as_str()).unwrap() }),
+            theme_dark: row.get("theme_dark")?,
+            theme_light: row.get("theme_light")?,
+            hide_window_controls: row.get("hide_window_controls")?,
+            update_channel: row.get("update_channel")?,
+            autoupdate: row.get("autoupdate")?,
+            auto_download_updates: row.get("auto_download_updates")?,
+            hide_license_badge: row.get("hide_license_badge")?,
+            prompt_feedback: row.get("prompt_feedback")?,
+            mcp_server_enabled: row.get("mcp_server_enabled")?,
+            colored_methods: row.get("colored_methods")?,
+            check_notifications: row.get("check_notifications")?,
+            hotkeys: serde_json::from_str(&hotkeys).unwrap_or_default(),
+        })
+    }
+}
+
+impl Default for Workspace {
+    fn default() -> Self {
+        Self {
+            model: "workspace".to_string(),
+            id: String::new(),
+            created_at: NaiveDateTime::default(),
+            updated_at: NaiveDateTime::default(),
+            authentication: BTreeMap::new(),
+            authentication_type: None,
+            description: String::new(),
+            headers: Vec::new(),
+            name: String::new(),
+            encryption_key_challenge: None,
+            setting_validate_certificates: true,
+            setting_follow_redirects: true,
+            setting_request_timeout: 0,
+            setting_request_message_size: DEFAULT_REQUEST_MESSAGE_SIZE,
+            setting_dns_overrides: Vec::new(),
+            setting_send_cookies: true,
+            setting_store_cookies: true,
+            setting_http_version: HttpVersion::Auto,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(default, rename_all = "camelCase")]
+#[ts(export, export_to = "gen_models.ts")]
+#[enum_def(table_name = "workspaces")]
+pub struct Workspace {
+    #[ts(type = "\"workspace\"")]
+    pub model: String,
+    pub id: String,
+    pub created_at: NaiveDateTime,
+    pub updated_at: NaiveDateTime,
+
+    #[ts(type = "Record<string, any>")]
+    pub authentication: BTreeMap<String, Value>,
+    pub authentication_type: Option<String>,
+    pub description: String,
+    pub headers: Vec<HttpRequestHeader>,
+    pub name: String,
+    pub encryption_key_challenge: Option<String>,
+
+    // Settings
+    pub setting_validate_certificates: bool,
+    pub setting_follow_redirects: bool,
+    pub setting_request_timeout: i32,
+    pub setting_request_message_size: i32,
+    #[serde(default)]
+    pub setting_dns_overrides: Vec<DnsOverride>,
+    pub setting_send_cookies: bool,
+    pub setting_store_cookies: bool,
+    pub setting_http_version: HttpVersion,
+}
+
+impl UpsertModelInfo for Workspace {
+    fn table_name() -> impl IntoTableRef + IntoIden {
+        WorkspaceIden::Table
+    }
+
+    fn id_column() -> impl IntoIden + Eq + Clone {
+        WorkspaceIden::Id
+    }
+
+    fn generate_id() -> String {
+        generate_prefixed_id("wk")
+    }
+
+    fn order_by() -> (impl IntoColumnRef, Order) {
+        (WorkspaceIden::CreatedAt, Desc)
+    }
+
+    fn get_id(&self) -> String {
+        self.id.clone()
+    }
+
+    fn insert_values(
+        self,
+        source: &UpdateSource,
+    ) -> DbResult<Vec<(impl IntoIden + Eq, impl Into<SimpleExpr>)>> {
+        use WorkspaceIden::*;
+        Ok(vec![
+            (CreatedAt, upsert_date(source, self.created_at)),
+            (UpdatedAt, upsert_date(source, self.updated_at)),
+            (Name, self.name.trim().into()),
+            (Authentication, serde_json::to_string(&self.authentication)?.into()),
+            (AuthenticationType, self.authentication_type.into()),
+            (Headers, serde_json::to_string(&self.headers)?.into()),
+            (Description, self.description.into()),
+            (EncryptionKeyChallenge, self.encryption_key_challenge.into()),
+            (SettingFollowRedirects, self.setting_follow_redirects.into()),
+            (SettingRequestTimeout, self.setting_request_timeout.into()),
+            (SettingRequestMessageSize, self.setting_request_message_size.into()),
+            (SettingValidateCertificates, self.setting_validate_certificates.into()),
+            (SettingDnsOverrides, serde_json::to_string(&self.setting_dns_overrides)?.into()),
+            (SettingSendCookies, self.setting_send_cookies.into()),
+            (SettingStoreCookies, self.setting_store_cookies.into()),
+            (SettingHttpVersion, self.setting_http_version.to_string().into()),
+        ])
+    }
+
+    fn update_columns() -> Vec<impl IntoIden> {
+        vec![
+            WorkspaceIden::UpdatedAt,
+            WorkspaceIden::Name,
+            WorkspaceIden::Authentication,
+            WorkspaceIden::AuthenticationType,
+            WorkspaceIden::Headers,
+            WorkspaceIden::Description,
+            WorkspaceIden::EncryptionKeyChallenge,
+            WorkspaceIden::SettingRequestTimeout,
+            WorkspaceIden::SettingFollowRedirects,
+            WorkspaceIden::SettingRequestMessageSize,
+            WorkspaceIden::SettingValidateCertificates,
+            WorkspaceIden::SettingDnsOverrides,
+            WorkspaceIden::SettingSendCookies,
+            WorkspaceIden::SettingStoreCookies,
+            WorkspaceIden::SettingHttpVersion,
+        ]
+    }
+
+    fn from_row(row: &Row) -> rusqlite::Result<Self>
+    where
+        Self: Sized,
+    {
+        let headers: String = row.get("headers")?;
+        let authentication: String = row.get("authentication")?;
+        let setting_dns_overrides: String = row.get("setting_dns_overrides")?;
+        let setting_http_version: String = row.get("setting_http_version")?;
+        Ok(Self {
+            id: row.get("id")?,
+            model: row.get("model")?,
+            created_at: row.get("created_at")?,
+            updated_at: row.get("updated_at")?,
+            name: row.get("name")?,
+            description: row.get("description")?,
+            encryption_key_challenge: row.get("encryption_key_challenge")?,
+            headers: serde_json::from_str(&headers).unwrap_or_default(),
+            authentication: serde_json::from_str(&authentication).unwrap_or_default(),
+            authentication_type: row.get("authentication_type")?,
+            setting_follow_redirects: row.get("setting_follow_redirects")?,
+            setting_request_timeout: row.get("setting_request_timeout")?,
+            setting_request_message_size: row.get("setting_request_message_size")?,
+            setting_validate_certificates: row.get("setting_validate_certificates")?,
+            setting_dns_overrides: serde_json::from_str(&setting_dns_overrides).unwrap_or_default(),
+            setting_send_cookies: row.get("setting_send_cookies")?,
+            setting_store_cookies: row.get("setting_store_cookies")?,
+            setting_http_version: setting_http_version.parse().unwrap_or_default(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default, TS)]
+#[serde(default, rename_all = "camelCase")]
+#[ts(export, export_to = "gen_models.ts")]
+pub struct EncryptedKey {
+    pub encrypted_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, TS)]
+#[serde(default, rename_all = "camelCase")]
+#[ts(export, export_to = "gen_models.ts")]
+#[enum_def(table_name = "workspace_metas")]
+pub struct WorkspaceMeta {
+    #[ts(type = "\"workspace_meta\"")]
+    pub model: String,
+    pub id: String,
+    pub workspace_id: String,
+    pub created_at: NaiveDateTime,
+    pub updated_at: NaiveDateTime,
+    pub encryption_key: Option<EncryptedKey>,
+    pub setting_sync_dir: Option<String>,
+}
+
+impl UpsertModelInfo for WorkspaceMeta {
+    fn table_name() -> impl IntoTableRef + IntoIden {
+        WorkspaceMetaIden::Table
+    }
+
+    fn id_column() -> impl IntoIden + Eq + Clone {
+        WorkspaceMetaIden::Id
+    }
+
+    fn generate_id() -> String {
+        generate_prefixed_id("wm")
+    }
+
+    fn order_by() -> (impl IntoColumnRef, Order) {
+        (WorkspaceMetaIden::CreatedAt, Desc)
+    }
+
+    fn get_id(&self) -> String {
+        self.id.clone()
+    }
+
+    fn insert_values(
+        self,
+        source: &UpdateSource,
+    ) -> DbResult<Vec<(impl IntoIden + Eq, impl Into<SimpleExpr>)>> {
+        use WorkspaceMetaIden::*;
+        Ok(vec![
+            (CreatedAt, upsert_date(source, self.created_at)),
+            (UpdatedAt, upsert_date(source, self.updated_at)),
+            (WorkspaceId, self.workspace_id.into()),
+            (EncryptionKey, self.encryption_key.map(|e| serde_json::to_string(&e).unwrap()).into()),
+            (SettingSyncDir, self.setting_sync_dir.into()),
+        ])
+    }
+
+    fn update_columns() -> Vec<impl IntoIden> {
+        vec![
+            WorkspaceMetaIden::UpdatedAt,
+            WorkspaceMetaIden::EncryptionKey,
+            WorkspaceMetaIden::SettingSyncDir,
+        ]
+    }
+
+    fn from_row(row: &Row) -> rusqlite::Result<Self>
+    where
+        Self: Sized,
+    {
+        let encryption_key: Option<String> = row.get("encryption_key")?;
+        Ok(Self {
+            id: row.get("id")?,
+            workspace_id: row.get("workspace_id")?,
+            model: row.get("model")?,
+            created_at: row.get("created_at")?,
+            updated_at: row.get("updated_at")?,
+            encryption_key: encryption_key.map(|e| serde_json::from_str(&e).unwrap()),
+            setting_sync_dir: row.get("setting_sync_dir")?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq)]
+#[ts(export, export_to = "gen_models.ts")]
+pub enum CookieDomain {
+    HostOnly(String),
+    Suffix(String),
+    NotPresent,
+    Empty,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq)]
+#[ts(export, export_to = "gen_models.ts")]
+pub enum CookieExpires {
+    AtUtc(String),
+    SessionEnd,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq)]
+#[ts(export, export_to = "gen_models.ts")]
+pub enum CookieSameSite {
+    Strict,
+    Lax,
+    None,
+}
+
+#[derive(Debug, Clone, Serialize, TS, PartialEq)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "gen_models.ts")]
+pub struct Cookie {
+    pub name: String,
+    pub value: String,
+    pub domain: CookieDomain,
+    pub expires: CookieExpires,
+    pub path: String,
+    pub secure: bool,
+    pub http_only: bool,
+    pub same_site: Option<CookieSameSite>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CookieFields {
+    name: String,
+    value: String,
+    domain: CookieDomain,
+    expires: CookieExpires,
+    path: String,
+    #[serde(default)]
+    secure: bool,
+    #[serde(default)]
+    http_only: bool,
+    #[serde(default)]
+    same_site: Option<CookieSameSite>,
+}
+
+#[derive(Deserialize)]
+struct LegacyCookie {
+    raw_cookie: String,
+    domain: CookieDomain,
+    expires: CookieExpires,
+    path: (String, bool),
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum CookieCompat {
+    New(CookieFields),
+    Legacy(LegacyCookie),
+}
+
+impl<'de> Deserialize<'de> for Cookie {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(match CookieCompat::deserialize(deserializer)? {
+            CookieCompat::New(cookie) => Self {
+                name: cookie.name,
+                value: cookie.value,
+                domain: cookie.domain,
+                expires: cookie.expires,
+                path: cookie.path,
+                secure: cookie.secure,
+                http_only: cookie.http_only,
+                same_site: cookie.same_site,
+            },
+            CookieCompat::Legacy(cookie) => {
+                let (name, value, secure, http_only, same_site) =
+                    parse_legacy_cookie_parts(&cookie.raw_cookie);
+                Self {
+                    name,
+                    value,
+                    domain: cookie.domain,
+                    expires: cookie.expires,
+                    path: cookie.path.0,
+                    secure,
+                    http_only,
+                    same_site,
+                }
+            }
+        })
+    }
+}
+
+fn parse_legacy_cookie_parts(
+    raw_cookie: &str,
+) -> (String, String, bool, bool, Option<CookieSameSite>) {
+    let mut parts = raw_cookie.split(';').map(str::trim);
+    let (name, value) = parts
+        .next()
+        .and_then(|part| {
+            let mut nv = part.splitn(2, '=');
+            Some((nv.next()?.trim().to_string(), nv.next().unwrap_or("").trim().to_string()))
+        })
+        .unwrap_or_default();
+
+    let mut secure = false;
+    let mut http_only = false;
+    let mut same_site = None;
+
+    for part in parts {
+        let mut attr = part.splitn(2, '=');
+        let key = attr.next().unwrap_or("").trim().to_lowercase();
+        let value = attr.next().unwrap_or("").trim().to_lowercase();
+        match key.as_str() {
+            "secure" => secure = true,
+            "httponly" => http_only = true,
+            "samesite" => {
+                same_site = match value.as_str() {
+                    "strict" => Some(CookieSameSite::Strict),
+                    "lax" => Some(CookieSameSite::Lax),
+                    "none" => Some(CookieSameSite::None),
+                    _ => same_site,
+                };
+            }
+            _ => {}
+        }
+    }
+
+    (name, value, secure, http_only, same_site)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, TS)]
+#[serde(default, rename_all = "camelCase")]
+#[ts(export, export_to = "gen_models.ts")]
+#[enum_def(table_name = "cookie_jars")]
+pub struct CookieJar {
+    #[ts(type = "\"cookie_jar\"")]
+    pub model: String,
+    pub id: String,
+    pub created_at: NaiveDateTime,
+    pub updated_at: NaiveDateTime,
+    pub workspace_id: String,
+
+    pub cookies: Vec<Cookie>,
+    pub name: String,
+}
+
+impl UpsertModelInfo for CookieJar {
+    fn table_name() -> impl IntoTableRef + IntoIden {
+        CookieJarIden::Table
+    }
+
+    fn id_column() -> impl IntoIden + Eq + Clone {
+        CookieJarIden::Id
+    }
+
+    fn generate_id() -> String {
+        generate_prefixed_id("cj")
+    }
+
+    fn order_by() -> (impl IntoColumnRef, Order) {
+        (CookieJarIden::CreatedAt, Desc)
+    }
+
+    fn get_id(&self) -> String {
+        self.id.clone()
+    }
+
+    fn insert_values(
+        self,
+        source: &UpdateSource,
+    ) -> DbResult<Vec<(impl IntoIden + Eq, impl Into<SimpleExpr>)>> {
+        use CookieJarIden::*;
+        Ok(vec![
+            (CreatedAt, upsert_date(source, self.created_at)),
+            (UpdatedAt, upsert_date(source, self.updated_at)),
+            (WorkspaceId, self.workspace_id.into()),
+            (Name, self.name.trim().into()),
+            (Cookies, serde_json::to_string(&self.cookies)?.into()),
+        ])
+    }
+
+    fn update_columns() -> Vec<impl IntoIden> {
+        vec![
+            CookieJarIden::UpdatedAt,
+            CookieJarIden::Name,
+            CookieJarIden::Cookies,
+        ]
+    }
+
+    fn from_row(row: &Row) -> rusqlite::Result<Self>
+    where
+        Self: Sized,
+    {
+        let cookies: String = row.get("cookies")?;
+        Ok(Self {
+            id: row.get("id")?,
+            model: row.get("model")?,
+            workspace_id: row.get("workspace_id")?,
+            created_at: row.get("created_at")?,
+            updated_at: row.get("updated_at")?,
+            name: row.get("name")?,
+            cookies: serde_json::from_str(cookies.as_str()).unwrap_or_default(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default, JsonSchema, TS)]
+#[serde(default, rename_all = "camelCase")]
+#[ts(export, export_to = "gen_models.ts")]
+#[enum_def(table_name = "environments")]
+pub struct Environment {
+    #[ts(type = "\"environment\"")]
+    pub model: String,
+    pub id: String,
+    pub workspace_id: String,
+    pub created_at: NaiveDateTime,
+    pub updated_at: NaiveDateTime,
+
+    pub name: String,
+    pub public: bool,
+    #[deprecated(
+        note = "parent_model is used instead. This field will be removed when schema field is added for sync/export."
+    )]
+    #[ts(skip)]
+    pub base: bool,
+    pub parent_model: String,
+    pub parent_id: Option<String>,
+    /// Variables defined in this environment scope.
+    /// Child environments override parent variables by name.
+    pub variables: Vec<EnvironmentVariable>,
+    pub color: Option<String>,
+    pub sort_priority: f64,
+}
+
+impl UpsertModelInfo for Environment {
+    fn table_name() -> impl IntoTableRef + IntoIden {
+        EnvironmentIden::Table
+    }
+
+    fn id_column() -> impl IntoIden + Eq + Clone {
+        EnvironmentIden::Id
+    }
+
+    fn generate_id() -> String {
+        generate_prefixed_id("ev")
+    }
+
+    fn order_by() -> (impl IntoColumnRef, Order) {
+        (EnvironmentIden::CreatedAt, Desc)
+    }
+
+    fn get_id(&self) -> String {
+        self.id.clone()
+    }
+
+    fn insert_values(
+        self,
+        source: &UpdateSource,
+    ) -> DbResult<Vec<(impl IntoIden + Eq, impl Into<SimpleExpr>)>> {
+        use EnvironmentIden::*;
+        Ok(vec![
+            (CreatedAt, upsert_date(source, self.created_at)),
+            (UpdatedAt, upsert_date(source, self.updated_at)),
+            (WorkspaceId, self.workspace_id.into()),
+            (ParentId, self.parent_id.into()),
+            (ParentModel, self.parent_model.into()),
+            (Color, self.color.into()),
+            (Name, self.name.trim().into()),
+            (Public, self.public.into()),
+            (SortPriority, self.sort_priority.into()),
+            (Variables, serde_json::to_string(&self.variables)?.into()),
+        ])
+    }
+
+    fn update_columns() -> Vec<impl IntoIden> {
+        vec![
+            EnvironmentIden::UpdatedAt,
+            EnvironmentIden::ParentId,
+            EnvironmentIden::ParentModel,
+            EnvironmentIden::Color,
+            EnvironmentIden::Name,
+            EnvironmentIden::Public,
+            EnvironmentIden::Variables,
+            EnvironmentIden::SortPriority,
+        ]
+    }
+
+    fn from_row(row: &Row) -> rusqlite::Result<Self>
+    where
+        Self: Sized,
+    {
+        let variables: String = row.get("variables")?;
+        let parent_model = row.get("parent_model")?;
+        let base = parent_model == "workspace";
+        Ok(Self {
+            id: row.get("id")?,
+            model: row.get("model")?,
+            workspace_id: row.get("workspace_id")?,
+            created_at: row.get("created_at")?,
+            updated_at: row.get("updated_at")?,
+            parent_id: row.get("parent_id")?,
+            parent_model,
+            color: row.get("color")?,
+            name: row.get("name")?,
+            public: row.get("public")?,
+            variables: serde_json::from_str(variables.as_str()).unwrap_or_default(),
+            sort_priority: row.get("sort_priority")?,
+
+            // Deprecated field, but we need to keep it around for a couple of versions
+            // for compatibility because sync/export don't have a schema field
+            #[allow(deprecated)]
+            base,
+        })
+    }
+}
+
+impl Default for EnvironmentVariable {
+    fn default() -> Self {
+        Self { enabled: true, name: String::new(), value: String::new(), id: None }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(default, rename_all = "camelCase")]
+#[ts(export, export_to = "gen_models.ts")]
+pub struct EnvironmentVariable {
+    #[ts(optional, as = "Option<bool>")]
+    pub enabled: bool,
+    pub name: String,
+    pub value: String,
+    #[ts(optional, as = "Option<String>")]
+    pub id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default, TS)]
+#[serde(default, rename_all = "camelCase")]
+#[ts(export, export_to = "gen_models.ts")]
+pub struct ParentAuthentication {
+    #[ts(type = "Record<string, any>")]
+    pub authentication: BTreeMap<String, Value>,
+    pub authentication_type: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default, TS)]
+#[serde(default, rename_all = "camelCase")]
+#[ts(export, export_to = "gen_models.ts")]
+pub struct ParentHeaders {
+    pub headers: Vec<HttpRequestHeader>,
+}
+
+impl Default for Folder {
+    fn default() -> Self {
+        Self {
+            model: "folder".to_string(),
+            id: String::new(),
+            created_at: NaiveDateTime::default(),
+            updated_at: NaiveDateTime::default(),
+            workspace_id: String::new(),
+            folder_id: None,
+            authentication: BTreeMap::new(),
+            authentication_type: None,
+            description: String::new(),
+            headers: Vec::new(),
+            name: String::new(),
+            sort_priority: 0.0,
+            setting_send_cookies: InheritedBoolSetting::default(),
+            setting_store_cookies: InheritedBoolSetting::default(),
+            setting_validate_certificates: InheritedBoolSetting::default(),
+            setting_follow_redirects: InheritedBoolSetting::default(),
+            setting_request_timeout: InheritedIntSetting::default(),
+            setting_request_message_size: InheritedIntSetting {
+                enabled: false,
+                value: DEFAULT_REQUEST_MESSAGE_SIZE,
+            },
+            setting_http_version: InheritedHttpVersionSetting::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(default, rename_all = "camelCase")]
+#[ts(export, export_to = "gen_models.ts")]
+#[enum_def(table_name = "folders")]
+pub struct Folder {
+    #[ts(type = "\"folder\"")]
+    pub model: String,
+    pub id: String,
+    pub created_at: NaiveDateTime,
+    pub updated_at: NaiveDateTime,
+    pub workspace_id: String,
+    pub folder_id: Option<String>,
+
+    #[ts(type = "Record<string, any>")]
+    pub authentication: BTreeMap<String, Value>,
+    pub authentication_type: Option<String>,
+    pub description: String,
+    pub headers: Vec<HttpRequestHeader>,
+    pub name: String,
+    pub sort_priority: f64,
+    pub setting_send_cookies: InheritedBoolSetting,
+    pub setting_store_cookies: InheritedBoolSetting,
+    pub setting_validate_certificates: InheritedBoolSetting,
+    pub setting_follow_redirects: InheritedBoolSetting,
+    pub setting_request_timeout: InheritedIntSetting,
+    pub setting_request_message_size: InheritedIntSetting,
+    pub setting_http_version: InheritedHttpVersionSetting,
+}
+
+impl UpsertModelInfo for Folder {
+    fn table_name() -> impl IntoTableRef + IntoIden {
+        FolderIden::Table
+    }
+
+    fn id_column() -> impl IntoIden + Eq + Clone {
+        FolderIden::Id
+    }
+
+    fn generate_id() -> String {
+        generate_prefixed_id("fl")
+    }
+
+    fn order_by() -> (impl IntoColumnRef, Order) {
+        (FolderIden::CreatedAt, Desc)
+    }
+
+    fn get_id(&self) -> String {
+        self.id.clone()
+    }
+
+    fn insert_values(
+        self,
+        source: &UpdateSource,
+    ) -> DbResult<Vec<(impl IntoIden + Eq, impl Into<SimpleExpr>)>> {
+        use FolderIden::*;
+        Ok(vec![
+            (CreatedAt, upsert_date(source, self.created_at)),
+            (UpdatedAt, upsert_date(source, self.updated_at)),
+            (WorkspaceId, self.workspace_id.into()),
+            (FolderId, self.folder_id.into()),
+            (Authentication, serde_json::to_string(&self.authentication)?.into()),
+            (AuthenticationType, self.authentication_type.into()),
+            (Headers, serde_json::to_string(&self.headers)?.into()),
+            (Description, self.description.into()),
+            (Name, self.name.trim().into()),
+            (SortPriority, self.sort_priority.into()),
+            (SettingSendCookies, serde_json::to_string(&self.setting_send_cookies)?.into()),
+            (SettingStoreCookies, serde_json::to_string(&self.setting_store_cookies)?.into()),
+            (
+                SettingValidateCertificates,
+                serde_json::to_string(&self.setting_validate_certificates)?.into(),
+            ),
+            (SettingFollowRedirects, serde_json::to_string(&self.setting_follow_redirects)?.into()),
+            (SettingRequestTimeout, serde_json::to_string(&self.setting_request_timeout)?.into()),
+            (
+                SettingRequestMessageSize,
+                serde_json::to_string(&self.setting_request_message_size)?.into(),
+            ),
+            (SettingHttpVersion, serde_json::to_string(&self.setting_http_version)?.into()),
+        ])
+    }
+
+    fn update_columns() -> Vec<impl IntoIden> {
+        vec![
+            FolderIden::UpdatedAt,
+            FolderIden::Name,
+            FolderIden::Authentication,
+            FolderIden::AuthenticationType,
+            FolderIden::Headers,
+            FolderIden::Description,
+            FolderIden::FolderId,
+            FolderIden::SortPriority,
+            FolderIden::SettingSendCookies,
+            FolderIden::SettingStoreCookies,
+            FolderIden::SettingValidateCertificates,
+            FolderIden::SettingFollowRedirects,
+            FolderIden::SettingRequestTimeout,
+            FolderIden::SettingRequestMessageSize,
+            FolderIden::SettingHttpVersion,
+        ]
+    }
+
+    fn from_row(row: &Row) -> rusqlite::Result<Self>
+    where
+        Self: Sized,
+    {
+        let headers: String = row.get("headers")?;
+        let authentication: String = row.get("authentication")?;
+        let setting_send_cookies: String = row.get("setting_send_cookies")?;
+        let setting_store_cookies: String = row.get("setting_store_cookies")?;
+        let setting_validate_certificates: String = row.get("setting_validate_certificates")?;
+        let setting_follow_redirects: String = row.get("setting_follow_redirects")?;
+        let setting_request_timeout: String = row.get("setting_request_timeout")?;
+        let setting_request_message_size: String = row.get("setting_request_message_size")?;
+        let setting_http_version: String = row.get("setting_http_version")?;
+        Ok(Self {
+            id: row.get("id")?,
+            model: row.get("model")?,
+            sort_priority: row.get("sort_priority")?,
+            workspace_id: row.get("workspace_id")?,
+            created_at: row.get("created_at")?,
+            updated_at: row.get("updated_at")?,
+            folder_id: row.get("folder_id")?,
+            name: row.get("name")?,
+            description: row.get("description")?,
+            headers: serde_json::from_str(&headers).unwrap_or_default(),
+            authentication_type: row.get("authentication_type")?,
+            authentication: serde_json::from_str(&authentication).unwrap_or_default(),
+            setting_send_cookies: serde_json::from_str(&setting_send_cookies).unwrap_or_default(),
+            setting_store_cookies: serde_json::from_str(&setting_store_cookies).unwrap_or_default(),
+            setting_validate_certificates: serde_json::from_str(&setting_validate_certificates)
+                .unwrap_or_default(),
+            setting_follow_redirects: serde_json::from_str(&setting_follow_redirects)
+                .unwrap_or_default(),
+            setting_request_timeout: serde_json::from_str(&setting_request_timeout)
+                .unwrap_or_default(),
+            setting_request_message_size: serde_json::from_str(&setting_request_message_size)
+                .unwrap_or_else(|_| default_request_message_size_setting()),
+            setting_http_version: serde_json::from_str(&setting_http_version).unwrap_or_default(),
+        })
+    }
+}
+
+impl Default for HttpRequestHeader {
+    fn default() -> Self {
+        Self { enabled: true, name: String::new(), value: String::new(), id: None }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(default, rename_all = "camelCase")]
+#[ts(export, export_to = "gen_models.ts")]
+pub struct HttpRequestHeader {
+    #[ts(optional, as = "Option<bool>")]
+    pub enabled: bool,
+    pub name: String,
+    pub value: String,
+    #[ts(optional, as = "Option<String>")]
+    pub id: Option<String>,
+}
+
+impl Default for HttpUrlParameter {
+    fn default() -> Self {
+        Self { enabled: true, name: String::new(), value: String::new(), id: None }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(default, rename_all = "camelCase")]
+#[ts(export, export_to = "gen_models.ts")]
+pub struct HttpUrlParameter {
+    #[ts(optional, as = "Option<bool>")]
+    pub enabled: bool,
+    /// Colon-prefixed parameters are treated as path parameters if they match, like `/users/:id`
+    /// Other entries are appended as query parameters
+    pub name: String,
+    pub value: String,
+    #[ts(optional, as = "Option<String>")]
+    pub id: Option<String>,
+}
+
+impl Default for HttpRequest {
+    fn default() -> Self {
+        Self {
+            model: "http_request".to_string(),
+            id: String::new(),
+            created_at: NaiveDateTime::default(),
+            updated_at: NaiveDateTime::default(),
+            workspace_id: String::new(),
+            folder_id: None,
+            authentication: BTreeMap::new(),
+            authentication_type: None,
+            body: BTreeMap::new(),
+            body_type: None,
+            description: String::new(),
+            headers: Vec::new(),
+            method: "GET".to_string(),
+            name: String::new(),
+            sort_priority: 0.0,
+            url: String::new(),
+            url_parameters: Vec::new(),
+            setting_send_cookies: InheritedBoolSetting::default(),
+            setting_store_cookies: InheritedBoolSetting::default(),
+            setting_validate_certificates: InheritedBoolSetting::default(),
+            setting_follow_redirects: InheritedBoolSetting::default(),
+            setting_request_timeout: InheritedIntSetting::default(),
+            setting_http_version: InheritedHttpVersionSetting::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(default, rename_all = "camelCase")]
+#[ts(export, export_to = "gen_models.ts")]
+#[enum_def(table_name = "http_requests")]
+pub struct HttpRequest {
+    #[ts(type = "\"http_request\"")]
+    pub model: String,
+    pub id: String,
+    pub created_at: NaiveDateTime,
+    pub updated_at: NaiveDateTime,
+    pub workspace_id: String,
+    pub folder_id: Option<String>,
+
+    #[ts(type = "Record<string, any>")]
+    pub authentication: BTreeMap<String, Value>,
+    pub authentication_type: Option<String>,
+    #[ts(type = "Record<string, any>")]
+    pub body: BTreeMap<String, Value>,
+    pub body_type: Option<String>,
+    pub description: String,
+    pub headers: Vec<HttpRequestHeader>,
+    pub method: String,
+    pub name: String,
+    pub sort_priority: f64,
+    pub url: String,
+    /// URL parameters used for both path placeholders (`:id`) and query string entries.
+    pub url_parameters: Vec<HttpUrlParameter>,
+    pub setting_send_cookies: InheritedBoolSetting,
+    pub setting_store_cookies: InheritedBoolSetting,
+    pub setting_validate_certificates: InheritedBoolSetting,
+    pub setting_follow_redirects: InheritedBoolSetting,
+    pub setting_request_timeout: InheritedIntSetting,
+    pub setting_http_version: InheritedHttpVersionSetting,
+}
+
+impl UpsertModelInfo for HttpRequest {
+    fn table_name() -> impl IntoTableRef + IntoIden {
+        HttpRequestIden::Table
+    }
+
+    fn id_column() -> impl IntoIden + Eq + Clone {
+        HttpRequestIden::Id
+    }
+
+    fn generate_id() -> String {
+        generate_prefixed_id("rq")
+    }
+
+    fn order_by() -> (impl IntoColumnRef, Order) {
+        (HttpResponseIden::CreatedAt, Desc)
+    }
+
+    fn get_id(&self) -> String {
+        self.id.to_string()
+    }
+
+    fn insert_values(
+        self,
+        source: &UpdateSource,
+    ) -> DbResult<Vec<(impl IntoIden + Eq, impl Into<SimpleExpr>)>> {
+        Ok(vec![
+            (CreatedAt, upsert_date(source, self.created_at)),
+            (UpdatedAt, upsert_date(source, self.updated_at)),
+            (WorkspaceId, self.workspace_id.into()),
+            (FolderId, self.folder_id.into()),
+            (Name, self.name.trim().into()),
+            (Description, self.description.into()),
+            (Url, self.url.into()),
+            (UrlParameters, serde_json::to_string(&self.url_parameters)?.into()),
+            (Method, self.method.into()),
+            (Body, serde_json::to_string(&self.body)?.into()),
+            (BodyType, self.body_type.into()),
+            (Authentication, serde_json::to_string(&self.authentication)?.into()),
+            (AuthenticationType, self.authentication_type.into()),
+            (Headers, serde_json::to_string(&self.headers)?.into()),
+            (SortPriority, self.sort_priority.into()),
+            (SettingSendCookies, serde_json::to_string(&self.setting_send_cookies)?.into()),
+            (SettingStoreCookies, serde_json::to_string(&self.setting_store_cookies)?.into()),
+            (
+                SettingValidateCertificates,
+                serde_json::to_string(&self.setting_validate_certificates)?.into(),
+            ),
+            (SettingFollowRedirects, serde_json::to_string(&self.setting_follow_redirects)?.into()),
+            (SettingRequestTimeout, serde_json::to_string(&self.setting_request_timeout)?.into()),
+            (SettingHttpVersion, serde_json::to_string(&self.setting_http_version)?.into()),
+        ])
+    }
+
+    fn update_columns() -> Vec<impl IntoIden> {
+        vec![
+            UpdatedAt,
+            WorkspaceId,
+            Name,
+            Description,
+            FolderId,
+            Method,
+            Headers,
+            Body,
+            BodyType,
+            Authentication,
+            AuthenticationType,
+            Url,
+            UrlParameters,
+            SortPriority,
+            SettingSendCookies,
+            SettingStoreCookies,
+            SettingValidateCertificates,
+            SettingFollowRedirects,
+            SettingRequestTimeout,
+            SettingHttpVersion,
+        ]
+    }
+
+    fn from_row(row: &Row) -> rusqlite::Result<Self> {
+        let url_parameters: String = row.get("url_parameters")?;
+        let body: String = row.get("body")?;
+        let authentication: String = row.get("authentication")?;
+        let headers: String = row.get("headers")?;
+        let setting_send_cookies: String = row.get("setting_send_cookies")?;
+        let setting_store_cookies: String = row.get("setting_store_cookies")?;
+        let setting_validate_certificates: String = row.get("setting_validate_certificates")?;
+        let setting_follow_redirects: String = row.get("setting_follow_redirects")?;
+        let setting_request_timeout: String = row.get("setting_request_timeout")?;
+        let setting_http_version: String = row.get("setting_http_version")?;
+        Ok(Self {
+            id: row.get("id")?,
+            model: row.get("model")?,
+            workspace_id: row.get("workspace_id")?,
+            created_at: row.get("created_at")?,
+            updated_at: row.get("updated_at")?,
+            authentication: serde_json::from_str(authentication.as_str()).unwrap_or_default(),
+            authentication_type: row.get("authentication_type")?,
+            body: serde_json::from_str(body.as_str()).unwrap_or_default(),
+            body_type: row.get("body_type")?,
+            description: row.get("description")?,
+            folder_id: row.get("folder_id")?,
+            headers: serde_json::from_str(headers.as_str()).unwrap_or_default(),
+            method: row.get("method")?,
+            name: row.get("name")?,
+            sort_priority: row.get("sort_priority")?,
+            url: row.get("url")?,
+            url_parameters: serde_json::from_str(url_parameters.as_str()).unwrap_or_default(),
+            setting_send_cookies: serde_json::from_str(&setting_send_cookies).unwrap_or_default(),
+            setting_store_cookies: serde_json::from_str(&setting_store_cookies).unwrap_or_default(),
+            setting_validate_certificates: serde_json::from_str(&setting_validate_certificates)
+                .unwrap_or_default(),
+            setting_follow_redirects: serde_json::from_str(&setting_follow_redirects)
+                .unwrap_or_default(),
+            setting_request_timeout: serde_json::from_str(&setting_request_timeout)
+                .unwrap_or_default(),
+            setting_http_version: serde_json::from_str(&setting_http_version).unwrap_or_default(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "gen_models.ts")]
+pub enum WebsocketConnectionState {
+    Initialized,
+    Connected,
+    Closing,
+    Closed,
+}
+
+impl Default for WebsocketConnectionState {
+    fn default() -> Self {
+        Self::Initialized
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, TS)]
+#[serde(default, rename_all = "camelCase")]
+#[ts(export, export_to = "gen_models.ts")]
+#[enum_def(table_name = "websocket_connections")]
+pub struct WebsocketConnection {
+    #[ts(type = "\"websocket_connection\"")]
+    pub model: String,
+    pub id: String,
+    pub created_at: NaiveDateTime,
+    pub updated_at: NaiveDateTime,
+    pub workspace_id: String,
+    pub request_id: String,
+
+    pub elapsed: i32,
+    pub error: Option<String>,
+    pub headers: Vec<HttpResponseHeader>,
+    pub state: WebsocketConnectionState,
+    pub status: i32,
+    pub url: String,
+}
+
+impl UpsertModelInfo for WebsocketConnection {
+    fn table_name() -> impl IntoTableRef + IntoIden {
+        WebsocketConnectionIden::Table
+    }
+
+    fn id_column() -> impl IntoIden + Eq + Clone {
+        WebsocketConnectionIden::Id
+    }
+
+    fn generate_id() -> String {
+        generate_prefixed_id("wc")
+    }
+
+    fn order_by() -> (impl IntoColumnRef, Order) {
+        (WebsocketConnectionIden::CreatedAt, Desc)
+    }
+
+    fn get_id(&self) -> String {
+        self.id.clone()
+    }
+
+    fn insert_values(
+        self,
+        source: &UpdateSource,
+    ) -> DbResult<Vec<(impl IntoIden + Eq, impl Into<SimpleExpr>)>> {
+        use WebsocketConnectionIden::*;
+        Ok(vec![
+            (CreatedAt, upsert_date(source, self.created_at)),
+            (UpdatedAt, upsert_date(source, self.updated_at)),
+            (WorkspaceId, self.workspace_id.into()),
+            (RequestId, self.request_id.into()),
+            (Elapsed, self.elapsed.into()),
+            (Error, self.error.into()),
+            (Headers, serde_json::to_string(&self.headers)?.into()),
+            (State, serde_json::to_value(&self.state)?.as_str().into()),
+            (Status, self.status.into()),
+            (Url, self.url.into()),
+        ])
+    }
+
+    fn update_columns() -> Vec<impl IntoIden> {
+        vec![
+            WebsocketConnectionIden::UpdatedAt,
+            WebsocketConnectionIden::Elapsed,
+            WebsocketConnectionIden::Error,
+            WebsocketConnectionIden::Headers,
+            WebsocketConnectionIden::State,
+            WebsocketConnectionIden::Status,
+            WebsocketConnectionIden::Url,
+        ]
+    }
+
+    fn from_row(row: &Row) -> rusqlite::Result<Self>
+    where
+        Self: Sized,
+    {
+        let headers: String = row.get("headers")?;
+        let state: String = row.get("state")?;
+        Ok(Self {
+            id: row.get("id")?,
+            model: row.get("model")?,
+            workspace_id: row.get("workspace_id")?,
+            request_id: row.get("request_id")?,
+            created_at: row.get("created_at")?,
+            updated_at: row.get("updated_at")?,
+            url: row.get("url")?,
+            headers: serde_json::from_str(headers.as_str()).unwrap_or_default(),
+            elapsed: row.get("elapsed")?,
+            error: row.get("error")?,
+            state: serde_json::from_str(format!(r#""{state}""#).as_str()).unwrap(),
+            status: row.get("status")?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "gen_models.ts")]
+pub enum WebsocketMessageType {
+    Text,
+    Binary,
+}
+
+impl Default for WebsocketMessageType {
+    fn default() -> Self {
+        Self::Text
+    }
+}
+
+impl Default for WebsocketRequest {
+    fn default() -> Self {
+        Self {
+            model: "websocket_request".to_string(),
+            id: String::new(),
+            created_at: NaiveDateTime::default(),
+            updated_at: NaiveDateTime::default(),
+            workspace_id: String::new(),
+            folder_id: None,
+            authentication: BTreeMap::new(),
+            authentication_type: None,
+            description: String::new(),
+            headers: Vec::new(),
+            message: String::new(),
+            name: String::new(),
+            sort_priority: 0.0,
+            url: String::new(),
+            url_parameters: Vec::new(),
+            setting_send_cookies: InheritedBoolSetting::default(),
+            setting_store_cookies: InheritedBoolSetting::default(),
+            setting_validate_certificates: InheritedBoolSetting::default(),
+            setting_request_message_size: InheritedIntSetting {
+                enabled: false,
+                value: DEFAULT_REQUEST_MESSAGE_SIZE,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(default, rename_all = "camelCase")]
+#[ts(export, export_to = "gen_models.ts")]
+#[enum_def(table_name = "websocket_requests")]
+pub struct WebsocketRequest {
+    #[ts(type = "\"websocket_request\"")]
+    pub model: String,
+    pub id: String,
+    pub created_at: NaiveDateTime,
+    pub updated_at: NaiveDateTime,
+    pub workspace_id: String,
+    pub folder_id: Option<String>,
+
+    #[ts(type = "Record<string, any>")]
+    pub authentication: BTreeMap<String, Value>,
+    pub authentication_type: Option<String>,
+    pub description: String,
+    pub headers: Vec<HttpRequestHeader>,
+    pub message: String,
+    pub name: String,
+    pub sort_priority: f64,
+    pub url: String,
+    /// URL parameters used for both path placeholders (`:id`) and query string entries.
+    pub url_parameters: Vec<HttpUrlParameter>,
+    pub setting_send_cookies: InheritedBoolSetting,
+    pub setting_store_cookies: InheritedBoolSetting,
+    pub setting_validate_certificates: InheritedBoolSetting,
+    pub setting_request_message_size: InheritedIntSetting,
+}
+
+impl UpsertModelInfo for WebsocketRequest {
+    fn table_name() -> impl IntoTableRef + IntoIden {
+        WebsocketRequestIden::Table
+    }
+
+    fn id_column() -> impl IntoIden + Eq + Clone {
+        WebsocketRequestIden::Id
+    }
+
+    fn generate_id() -> String {
+        generate_prefixed_id("wr")
+    }
+
+    fn order_by() -> (impl IntoColumnRef, Order) {
+        (WebsocketRequestIden::CreatedAt, Desc)
+    }
+
+    fn get_id(&self) -> String {
+        self.id.clone()
+    }
+
+    fn insert_values(
+        self,
+        source: &UpdateSource,
+    ) -> DbResult<Vec<(impl IntoIden + Eq, impl Into<SimpleExpr>)>> {
+        use WebsocketRequestIden::*;
+        Ok(vec![
+            (CreatedAt, upsert_date(source, self.created_at)),
+            (UpdatedAt, upsert_date(source, self.updated_at)),
+            (WorkspaceId, self.workspace_id.into()),
+            (FolderId, self.folder_id.as_ref().map(|s| s.as_str()).into()),
+            (Authentication, serde_json::to_string(&self.authentication)?.into()),
+            (AuthenticationType, self.authentication_type.into()),
+            (Description, self.description.into()),
+            (Headers, serde_json::to_string(&self.headers)?.into()),
+            (Message, self.message.into()),
+            (Name, self.name.trim().into()),
+            (SortPriority, self.sort_priority.into()),
+            (Url, self.url.into()),
+            (UrlParameters, serde_json::to_string(&self.url_parameters)?.into()),
+            (SettingSendCookies, serde_json::to_string(&self.setting_send_cookies)?.into()),
+            (SettingStoreCookies, serde_json::to_string(&self.setting_store_cookies)?.into()),
+            (
+                SettingValidateCertificates,
+                serde_json::to_string(&self.setting_validate_certificates)?.into(),
+            ),
+            (
+                SettingRequestMessageSize,
+                serde_json::to_string(&self.setting_request_message_size)?.into(),
+            ),
+        ])
+    }
+
+    fn update_columns() -> Vec<impl IntoIden> {
+        vec![
+            WebsocketRequestIden::UpdatedAt,
+            WebsocketRequestIden::WorkspaceId,
+            WebsocketRequestIden::FolderId,
+            WebsocketRequestIden::Authentication,
+            WebsocketRequestIden::AuthenticationType,
+            WebsocketRequestIden::Description,
+            WebsocketRequestIden::Headers,
+            WebsocketRequestIden::Message,
+            WebsocketRequestIden::Name,
+            WebsocketRequestIden::SortPriority,
+            WebsocketRequestIden::Url,
+            WebsocketRequestIden::UrlParameters,
+            WebsocketRequestIden::SettingSendCookies,
+            WebsocketRequestIden::SettingStoreCookies,
+            WebsocketRequestIden::SettingValidateCertificates,
+            WebsocketRequestIden::SettingRequestMessageSize,
+        ]
+    }
+
+    fn from_row(row: &Row) -> rusqlite::Result<Self>
+    where
+        Self: Sized,
+    {
+        let url_parameters: String = row.get("url_parameters")?;
+        let authentication: String = row.get("authentication")?;
+        let headers: String = row.get("headers")?;
+        let setting_send_cookies: String = row.get("setting_send_cookies")?;
+        let setting_store_cookies: String = row.get("setting_store_cookies")?;
+        let setting_validate_certificates: String = row.get("setting_validate_certificates")?;
+        let setting_request_message_size: String = row.get("setting_request_message_size")?;
+        Ok(Self {
+            id: row.get("id")?,
+            model: row.get("model")?,
+            sort_priority: row.get("sort_priority")?,
+            workspace_id: row.get("workspace_id")?,
+            created_at: row.get("created_at")?,
+            updated_at: row.get("updated_at")?,
+            url: row.get("url")?,
+            url_parameters: serde_json::from_str(url_parameters.as_str()).unwrap_or_default(),
+            message: row.get("message")?,
+            description: row.get("description")?,
+            authentication: serde_json::from_str(authentication.as_str()).unwrap_or_default(),
+            authentication_type: row.get("authentication_type")?,
+            headers: serde_json::from_str(headers.as_str()).unwrap_or_default(),
+            folder_id: row.get("folder_id")?,
+            name: row.get("name")?,
+            setting_send_cookies: serde_json::from_str(&setting_send_cookies).unwrap_or_default(),
+            setting_store_cookies: serde_json::from_str(&setting_store_cookies).unwrap_or_default(),
+            setting_validate_certificates: serde_json::from_str(&setting_validate_certificates)
+                .unwrap_or_default(),
+            setting_request_message_size: serde_json::from_str(&setting_request_message_size)
+                .unwrap_or_else(|_| default_request_message_size_setting()),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "gen_models.ts")]
+pub enum WebsocketEventType {
+    Binary,
+    Close,
+    Error,
+    Frame,
+    Open,
+    Ping,
+    Pong,
+    Text,
+}
+
+impl Default for WebsocketEventType {
+    fn default() -> Self {
+        Self::Text
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, TS)]
+#[serde(default, rename_all = "camelCase")]
+#[ts(export, export_to = "gen_models.ts")]
+#[enum_def(table_name = "websocket_events")]
+pub struct WebsocketEvent {
+    #[ts(type = "\"websocket_event\"")]
+    pub model: String,
+    pub id: String,
+    pub created_at: NaiveDateTime,
+    pub updated_at: NaiveDateTime,
+    pub workspace_id: String,
+    pub request_id: String,
+    pub connection_id: String,
+    pub is_server: bool,
+
+    pub message: Vec<u8>,
+    pub message_type: WebsocketEventType,
+}
+
+impl UpsertModelInfo for WebsocketEvent {
+    fn table_name() -> impl IntoTableRef + IntoIden {
+        WebsocketEventIden::Table
+    }
+
+    fn id_column() -> impl IntoIden + Eq + Clone {
+        WebsocketEventIden::Id
+    }
+
+    fn generate_id() -> String {
+        generate_prefixed_id("we")
+    }
+
+    fn order_by() -> (impl IntoColumnRef, Order) {
+        (WebsocketEventIden::CreatedAt, Desc)
+    }
+
+    fn get_id(&self) -> String {
+        self.id.clone()
+    }
+
+    fn insert_values(
+        self,
+        source: &UpdateSource,
+    ) -> DbResult<Vec<(impl IntoIden + Eq, impl Into<SimpleExpr>)>> {
+        use WebsocketEventIden::*;
+        Ok(vec![
+            (CreatedAt, upsert_date(source, self.created_at)),
+            (UpdatedAt, upsert_date(source, self.updated_at)),
+            (WorkspaceId, self.workspace_id.into()),
+            (ConnectionId, self.connection_id.into()),
+            (RequestId, self.request_id.into()),
+            (MessageType, serde_json::to_string(&self.message_type)?.into()),
+            (IsServer, self.is_server.into()),
+            (Message, self.message.into()),
+        ])
+    }
+
+    fn update_columns() -> Vec<impl IntoIden> {
+        vec![
+            WebsocketEventIden::UpdatedAt,
+            WebsocketEventIden::MessageType,
+            WebsocketEventIden::IsServer,
+            WebsocketEventIden::Message,
+        ]
+    }
+
+    fn from_row(row: &Row) -> rusqlite::Result<Self>
+    where
+        Self: Sized,
+    {
+        let message_type: String = row.get("message_type")?;
+        Ok(Self {
+            id: row.get("id")?,
+            model: row.get("model")?,
+            workspace_id: row.get("workspace_id")?,
+            request_id: row.get("request_id")?,
+            connection_id: row.get("connection_id")?,
+            created_at: row.get("created_at")?,
+            updated_at: row.get("updated_at")?,
+            message: row.get("message")?,
+            is_server: row.get("is_server")?,
+            message_type: serde_json::from_str(message_type.as_str()).unwrap_or_default(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, TS)]
+#[serde(default, rename_all = "camelCase")]
+#[ts(export, export_to = "gen_models.ts")]
+pub struct HttpResponseHeader {
+    pub name: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "gen_models.ts")]
+pub enum HttpResponseState {
+    Initialized,
+    Connected,
+    Closed,
+}
+
+impl Default for HttpResponseState {
+    fn default() -> Self {
+        Self::Initialized
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, TS)]
+#[serde(default, rename_all = "camelCase")]
+#[ts(export, export_to = "gen_models.ts")]
+#[enum_def(table_name = "http_responses")]
+pub struct HttpResponse {
+    #[ts(type = "\"http_response\"")]
+    pub model: String,
+    pub id: String,
+    pub created_at: NaiveDateTime,
+    pub updated_at: NaiveDateTime,
+    pub workspace_id: String,
+    pub request_id: String,
+
+    /// Where the engine put the body, when it puts it in a file.
+    ///
+    /// Not exported to TypeScript: a path is only meaningful to a host that
+    /// has the filesystem it names, and bodies are moving off it. Read a body
+    /// by response id instead — the frontend through
+    /// `cmd_http_response_body_path`, plugins through `ctx.httpResponse.body`.
+    #[ts(skip)]
+    pub body_path: Option<String>,
+    pub content_length: Option<i32>,
+    pub content_length_compressed: Option<i32>,
+    pub elapsed: i32,
+    pub elapsed_headers: i32,
+    pub elapsed_dns: i32,
+    pub error: Option<String>,
+    pub headers: Vec<HttpResponseHeader>,
+    pub remote_addr: Option<String>,
+    pub request_content_length: Option<i32>,
+    pub request_headers: Vec<HttpResponseHeader>,
+    pub status: i32,
+    pub status_reason: Option<String>,
+    pub state: HttpResponseState,
+    pub url: String,
+    pub version: Option<String>,
+}
+
+impl UpsertModelInfo for HttpResponse {
+    fn table_name() -> impl IntoTableRef + IntoIden {
+        HttpResponseIden::Table
+    }
+
+    fn id_column() -> impl IntoIden + Eq + Clone {
+        HttpResponseIden::Id
+    }
+
+    fn generate_id() -> String {
+        generate_prefixed_id("rs")
+    }
+
+    fn order_by() -> (impl IntoColumnRef, Order) {
+        (HttpResponseIden::CreatedAt, Desc)
+    }
+
+    fn get_id(&self) -> String {
+        self.id.clone()
+    }
+
+    fn insert_values(
+        self,
+        source: &UpdateSource,
+    ) -> DbResult<Vec<(impl IntoIden + Eq, impl Into<SimpleExpr>)>> {
+        use HttpResponseIden::*;
+        Ok(vec![
+            (CreatedAt, upsert_date(source, self.created_at)),
+            (UpdatedAt, upsert_date(source, self.updated_at)),
+            (RequestId, self.request_id.into()),
+            (WorkspaceId, self.workspace_id.into()),
+            (BodyPath, self.body_path.into()),
+            (ContentLength, self.content_length.into()),
+            (ContentLengthCompressed, self.content_length_compressed.into()),
+            (Elapsed, self.elapsed.into()),
+            (ElapsedHeaders, self.elapsed_headers.into()),
+            (ElapsedDns, self.elapsed_dns.into()),
+            (Error, self.error.into()),
+            (Headers, serde_json::to_string(&self.headers)?.into()),
+            (RemoteAddr, self.remote_addr.into()),
+            (RequestHeaders, serde_json::to_string(&self.request_headers)?.into()),
+            (State, serde_json::to_value(self.state)?.as_str().into()),
+            (Status, self.status.into()),
+            (StatusReason, self.status_reason.into()),
+            (Url, self.url.into()),
+            (Version, self.version.into()),
+            (RequestContentLength, self.request_content_length.into()),
+        ])
+    }
+
+    fn update_columns() -> Vec<impl IntoIden> {
+        vec![
+            HttpResponseIden::UpdatedAt,
+            HttpResponseIden::BodyPath,
+            HttpResponseIden::ContentLength,
+            HttpResponseIden::ContentLengthCompressed,
+            HttpResponseIden::Elapsed,
+            HttpResponseIden::ElapsedHeaders,
+            HttpResponseIden::ElapsedDns,
+            HttpResponseIden::Error,
+            HttpResponseIden::Headers,
+            HttpResponseIden::RemoteAddr,
+            HttpResponseIden::RequestContentLength,
+            HttpResponseIden::RequestHeaders,
+            HttpResponseIden::State,
+            HttpResponseIden::Status,
+            HttpResponseIden::StatusReason,
+            HttpResponseIden::Url,
+            HttpResponseIden::Version,
+        ]
+    }
+
+    fn from_row(r: &Row) -> rusqlite::Result<Self>
+    where
+        Self: Sized,
+    {
+        let headers: String = r.get("headers")?;
+        let state: String = r.get("state")?;
+        Ok(Self {
+            id: r.get("id")?,
+            model: r.get("model")?,
+            workspace_id: r.get("workspace_id")?,
+            request_id: r.get("request_id")?,
+            created_at: r.get("created_at")?,
+            updated_at: r.get("updated_at")?,
+            error: r.get("error")?,
+            url: r.get("url")?,
+            content_length: r.get("content_length")?,
+            content_length_compressed: r.get("content_length_compressed").unwrap_or_default(),
+            version: r.get("version")?,
+            elapsed: r.get("elapsed")?,
+            elapsed_headers: r.get("elapsed_headers")?,
+            elapsed_dns: r.get("elapsed_dns").unwrap_or_default(),
+            remote_addr: r.get("remote_addr")?,
+            status: r.get("status")?,
+            status_reason: r.get("status_reason")?,
+            state: serde_json::from_str(format!(r#""{state}""#).as_str()).unwrap(),
+            body_path: r.get("body_path")?,
+            headers: serde_json::from_str(headers.as_str()).unwrap_or_default(),
+            request_content_length: r.get("request_content_length").unwrap_or_default(),
+            request_headers: serde_json::from_str(
+                r.get::<_, String>("request_headers").unwrap_or_default().as_str(),
+            )
+            .unwrap_or_default(),
+        })
+    }
+}
+
+/// Serializable representation of HTTP response events for DB storage.
+/// This mirrors `yaak_http::sender::HttpResponseEvent` but with serde support.
+/// The `From` impl is in yaak-http to avoid circular dependencies.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[ts(export, export_to = "gen_models.ts")]
+pub enum HttpResponseEventData {
+    Setting {
+        name: String,
+        value: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional, as = "Option<String>")]
+        source_model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional, as = "Option<String>")]
+        source_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional, as = "Option<String>")]
+        source_name: Option<String>,
+    },
+    Info {
+        message: String,
+    },
+    Redirect {
+        url: String,
+        status: u16,
+        behavior: String,
+        #[serde(default)]
+        dropped_body: bool,
+        #[serde(default)]
+        dropped_headers: Vec<String>,
+    },
+    SendUrl {
+        method: String,
+        #[serde(default)]
+        scheme: String,
+        #[serde(default)]
+        username: String,
+        #[serde(default)]
+        password: String,
+        #[serde(default)]
+        host: String,
+        #[serde(default)]
+        port: u16,
+        path: String,
+        #[serde(default)]
+        query: String,
+        #[serde(default)]
+        fragment: String,
+    },
+    ReceiveUrl {
+        version: String,
+        status: String,
+    },
+    HeaderUp {
+        name: String,
+        value: String,
+    },
+    HeaderDown {
+        name: String,
+        value: String,
+    },
+    ChunkSent {
+        bytes: usize,
+    },
+    ChunkReceived {
+        bytes: usize,
+    },
+    DnsResolved {
+        hostname: String,
+        addresses: Vec<String>,
+        duration: u64,
+        overridden: bool,
+    },
+}
+
+impl Default for HttpResponseEventData {
+    fn default() -> Self {
+        Self::Info { message: String::new() }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, TS)]
+#[serde(default, rename_all = "camelCase")]
+#[ts(export, export_to = "gen_models.ts")]
+#[enum_def(table_name = "http_response_events")]
+pub struct HttpResponseEvent {
+    #[ts(type = "\"http_response_event\"")]
+    pub model: String,
+    pub id: String,
+    pub created_at: NaiveDateTime,
+    pub updated_at: NaiveDateTime,
+    pub workspace_id: String,
+    pub response_id: String,
+    pub event: HttpResponseEventData,
+}
+
+impl UpsertModelInfo for HttpResponseEvent {
+    fn table_name() -> impl IntoTableRef + IntoIden {
+        HttpResponseEventIden::Table
+    }
+
+    fn id_column() -> impl IntoIden + Eq + Clone {
+        HttpResponseEventIden::Id
+    }
+
+    fn generate_id() -> String {
+        generate_prefixed_id("re")
+    }
+
+    fn order_by() -> (impl IntoColumnRef, Order) {
+        (HttpResponseEventIden::CreatedAt, Order::Asc)
+    }
+
+    fn get_id(&self) -> String {
+        self.id.clone()
+    }
+
+    fn insert_values(
+        self,
+        source: &UpdateSource,
+    ) -> DbResult<Vec<(impl IntoIden + Eq, impl Into<SimpleExpr>)>> {
+        use HttpResponseEventIden::*;
+        Ok(vec![
+            (CreatedAt, upsert_date(source, self.created_at)),
+            (UpdatedAt, upsert_date(source, self.updated_at)),
+            (WorkspaceId, self.workspace_id.into()),
+            (ResponseId, self.response_id.into()),
+            (Event, serde_json::to_string(&self.event)?.into()),
+        ])
+    }
+
+    fn update_columns() -> Vec<impl IntoIden> {
+        vec![
+            HttpResponseEventIden::UpdatedAt,
+            HttpResponseEventIden::Event,
+        ]
+    }
+
+    fn from_row(r: &Row) -> rusqlite::Result<Self>
+    where
+        Self: Sized,
+    {
+        let event: String = r.get("event")?;
+        Ok(Self {
+            id: r.get("id")?,
+            model: r.get("model")?,
+            workspace_id: r.get("workspace_id")?,
+            response_id: r.get("response_id")?,
+            created_at: r.get("created_at")?,
+            updated_at: r.get("updated_at")?,
+            event: serde_json::from_str(&event).unwrap_or_default(),
+        })
+    }
+}
+
+impl HttpResponseEvent {
+    pub fn new(response_id: &str, workspace_id: &str, event: HttpResponseEventData) -> Self {
+        Self {
+            model: "http_response_event".to_string(),
+            id: Self::generate_id(),
+            created_at: Utc::now().naive_utc(),
+            updated_at: Utc::now().naive_utc(),
+            workspace_id: workspace_id.to_string(),
+            response_id: response_id.to_string(),
+            event,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, TS)]
+#[serde(default, rename_all = "camelCase")]
+#[ts(export, export_to = "gen_models.ts")]
+#[enum_def(table_name = "graphql_introspections")]
+pub struct GraphQlIntrospection {
+    #[ts(type = "\"graphql_introspection\"")]
+    pub model: String,
+    pub id: String,
+    pub created_at: NaiveDateTime,
+    pub updated_at: NaiveDateTime,
+    pub workspace_id: String,
+    pub request_id: String,
+    pub content: Option<String>,
+}
+
+impl UpsertModelInfo for GraphQlIntrospection {
+    fn table_name() -> impl IntoTableRef + IntoIden {
+        GraphQlIntrospectionIden::Table
+    }
+
+    fn id_column() -> impl IntoIden + Eq + Clone {
+        GraphQlIntrospectionIden::Id
+    }
+
+    fn generate_id() -> String {
+        generate_prefixed_id("gi")
+    }
+
+    fn order_by() -> (impl IntoColumnRef, Order) {
+        (GraphQlIntrospectionIden::CreatedAt, Desc)
+    }
+
+    fn get_id(&self) -> String {
+        self.id.clone()
+    }
+
+    fn insert_values(
+        self,
+        source: &UpdateSource,
+    ) -> DbResult<Vec<(impl IntoIden + Eq, impl Into<SimpleExpr>)>> {
+        use GraphQlIntrospectionIden::*;
+        Ok(vec![
+            (CreatedAt, upsert_date(source, self.created_at)),
+            (UpdatedAt, upsert_date(source, self.updated_at)),
+            (WorkspaceId, self.workspace_id.into()),
+            (RequestId, self.request_id.into()),
+            (Content, self.content.into()),
+        ])
+    }
+
+    fn update_columns() -> Vec<impl IntoIden> {
+        vec![
+            GraphQlIntrospectionIden::UpdatedAt,
+            GraphQlIntrospectionIden::Content,
+        ]
+    }
+
+    fn from_row(r: &Row) -> rusqlite::Result<Self>
+    where
+        Self: Sized,
+    {
+        Ok(Self {
+            id: r.get("id")?,
+            model: r.get("model")?,
+            created_at: r.get("created_at")?,
+            updated_at: r.get("updated_at")?,
+            workspace_id: r.get("workspace_id")?,
+            request_id: r.get("request_id")?,
+            content: r.get("content")?,
+        })
+    }
+}
+
+impl Default for GrpcRequest {
+    fn default() -> Self {
+        Self {
+            model: "grpc_request".to_string(),
+            id: String::new(),
+            created_at: NaiveDateTime::default(),
+            updated_at: NaiveDateTime::default(),
+            workspace_id: String::new(),
+            folder_id: None,
+            authentication_type: None,
+            authentication: BTreeMap::new(),
+            description: String::new(),
+            message: String::new(),
+            metadata: Vec::new(),
+            method: None,
+            name: String::new(),
+            service: None,
+            sort_priority: 0.0,
+            url: String::new(),
+            setting_validate_certificates: InheritedBoolSetting::default(),
+            setting_request_message_size: InheritedIntSetting {
+                enabled: false,
+                value: DEFAULT_REQUEST_MESSAGE_SIZE,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(default, rename_all = "camelCase")]
+#[ts(export, export_to = "gen_models.ts")]
+#[enum_def(table_name = "grpc_requests")]
+pub struct GrpcRequest {
+    #[ts(type = "\"grpc_request\"")]
+    pub model: String,
+    pub id: String,
+    pub created_at: NaiveDateTime,
+    pub updated_at: NaiveDateTime,
+    pub workspace_id: String,
+    pub folder_id: Option<String>,
+
+    pub authentication_type: Option<String>,
+    #[ts(type = "Record<string, any>")]
+    pub authentication: BTreeMap<String, Value>,
+    pub description: String,
+    pub message: String,
+    pub metadata: Vec<HttpRequestHeader>,
+    pub method: Option<String>,
+    pub name: String,
+    pub service: Option<String>,
+    pub sort_priority: f64,
+    /// Server URL (http for plaintext or https for secure)
+    pub url: String,
+    pub setting_validate_certificates: InheritedBoolSetting,
+    pub setting_request_message_size: InheritedIntSetting,
+}
+
+impl UpsertModelInfo for GrpcRequest {
+    fn table_name() -> impl IntoTableRef + IntoIden {
+        GrpcRequestIden::Table
+    }
+
+    fn id_column() -> impl IntoIden + Eq + Clone {
+        GrpcRequestIden::Id
+    }
+
+    fn generate_id() -> String {
+        generate_prefixed_id("gr")
+    }
+
+    fn order_by() -> (impl IntoColumnRef, Order) {
+        (GrpcRequestIden::CreatedAt, Desc)
+    }
+
+    fn get_id(&self) -> String {
+        self.id.clone()
+    }
+
+    fn insert_values(
+        self,
+        source: &UpdateSource,
+    ) -> DbResult<Vec<(impl IntoIden + Eq, impl Into<SimpleExpr>)>> {
+        use GrpcRequestIden::*;
+        Ok(vec![
+            (CreatedAt, upsert_date(source, self.created_at)),
+            (UpdatedAt, upsert_date(source, self.updated_at)),
+            (Name, self.name.trim().into()),
+            (Description, self.description.into()),
+            (WorkspaceId, self.workspace_id.into()),
+            (FolderId, self.folder_id.into()),
+            (SortPriority, self.sort_priority.into()),
+            (Url, self.url.into()),
+            (Service, self.service.into()),
+            (Method, self.method.into()),
+            (Message, self.message.into()),
+            (AuthenticationType, self.authentication_type.into()),
+            (Authentication, serde_json::to_string(&self.authentication)?.into()),
+            (Metadata, serde_json::to_string(&self.metadata)?.into()),
+            (
+                SettingValidateCertificates,
+                serde_json::to_string(&self.setting_validate_certificates)?.into(),
+            ),
+            (
+                SettingRequestMessageSize,
+                serde_json::to_string(&self.setting_request_message_size)?.into(),
+            ),
+        ])
+    }
+
+    fn update_columns() -> Vec<impl IntoIden> {
+        vec![
+            GrpcRequestIden::UpdatedAt,
+            GrpcRequestIden::WorkspaceId,
+            GrpcRequestIden::Name,
+            GrpcRequestIden::Description,
+            GrpcRequestIden::FolderId,
+            GrpcRequestIden::SortPriority,
+            GrpcRequestIden::Url,
+            GrpcRequestIden::Service,
+            GrpcRequestIden::Method,
+            GrpcRequestIden::Message,
+            GrpcRequestIden::AuthenticationType,
+            GrpcRequestIden::Authentication,
+            GrpcRequestIden::Metadata,
+            GrpcRequestIden::SettingValidateCertificates,
+            GrpcRequestIden::SettingRequestMessageSize,
+        ]
+    }
+
+    fn from_row(row: &Row) -> rusqlite::Result<Self>
+    where
+        Self: Sized,
+    {
+        let authentication: String = row.get("authentication")?;
+        let metadata: String = row.get("metadata")?;
+        let setting_validate_certificates: String = row.get("setting_validate_certificates")?;
+        let setting_request_message_size: String = row.get("setting_request_message_size")?;
+        Ok(Self {
+            id: row.get("id")?,
+            model: row.get("model")?,
+            workspace_id: row.get("workspace_id")?,
+            created_at: row.get("created_at")?,
+            updated_at: row.get("updated_at")?,
+            folder_id: row.get("folder_id")?,
+            name: row.get("name")?,
+            description: row.get("description")?,
+            service: row.get("service")?,
+            method: row.get("method")?,
+            message: row.get("message")?,
+            authentication_type: row.get("authentication_type")?,
+            authentication: serde_json::from_str(authentication.as_str()).unwrap_or_default(),
+            url: row.get("url")?,
+            sort_priority: row.get("sort_priority")?,
+            metadata: serde_json::from_str(metadata.as_str()).unwrap_or_default(),
+            setting_validate_certificates: serde_json::from_str(&setting_validate_certificates)
+                .unwrap_or_default(),
+            setting_request_message_size: serde_json::from_str(&setting_request_message_size)
+                .unwrap_or_else(|_| default_request_message_size_setting()),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "gen_models.ts")]
+pub enum GrpcConnectionState {
+    Initialized,
+    Connected,
+    Closed,
+}
+
+impl Default for GrpcConnectionState {
+    fn default() -> Self {
+        Self::Initialized
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, TS)]
+#[serde(default, rename_all = "camelCase")]
+#[ts(export, export_to = "gen_models.ts")]
+#[enum_def(table_name = "grpc_connections")]
+pub struct GrpcConnection {
+    #[ts(type = "\"grpc_connection\"")]
+    pub model: String,
+    pub id: String,
+    pub created_at: NaiveDateTime,
+    pub updated_at: NaiveDateTime,
+    pub workspace_id: String,
+    pub request_id: String,
+
+    pub elapsed: i32,
+    pub error: Option<String>,
+    pub method: String,
+    pub service: String,
+    pub status: i32,
+    pub state: GrpcConnectionState,
+    pub trailers: BTreeMap<String, String>,
+    pub url: String,
+}
+
+impl UpsertModelInfo for GrpcConnection {
+    fn table_name() -> impl IntoTableRef + IntoIden {
+        GrpcConnectionIden::Table
+    }
+
+    fn id_column() -> impl IntoIden + Eq + Clone {
+        GrpcConnectionIden::Id
+    }
+
+    fn generate_id() -> String {
+        generate_prefixed_id("gc")
+    }
+
+    fn order_by() -> (impl IntoColumnRef, Order) {
+        (GrpcConnectionIden::CreatedAt, Desc)
+    }
+
+    fn get_id(&self) -> String {
+        self.id.clone()
+    }
+
+    fn insert_values(
+        self,
+        source: &UpdateSource,
+    ) -> DbResult<Vec<(impl IntoIden + Eq, impl Into<SimpleExpr>)>> {
+        use GrpcConnectionIden::*;
+        Ok(vec![
+            (CreatedAt, upsert_date(source, self.created_at)),
+            (UpdatedAt, upsert_date(source, self.updated_at)),
+            (WorkspaceId, self.workspace_id.into()),
+            (RequestId, self.request_id.into()),
+            (Service, self.service.into()),
+            (Method, self.method.into()),
+            (Elapsed, self.elapsed.into()),
+            (State, serde_json::to_value(&self.state)?.as_str().into()),
+            (Status, self.status.into()),
+            (Error, self.error.as_ref().map(|s| s.as_str()).into()),
+            (Trailers, serde_json::to_string(&self.trailers)?.into()),
+            (Url, self.url.into()),
+        ])
+    }
+
+    fn update_columns() -> Vec<impl IntoIden> {
+        vec![
+            GrpcConnectionIden::UpdatedAt,
+            GrpcConnectionIden::Service,
+            GrpcConnectionIden::Method,
+            GrpcConnectionIden::Elapsed,
+            GrpcConnectionIden::Status,
+            GrpcConnectionIden::State,
+            GrpcConnectionIden::Error,
+            GrpcConnectionIden::Trailers,
+            GrpcConnectionIden::Url,
+        ]
+    }
+
+    fn from_row(row: &Row) -> rusqlite::Result<Self>
+    where
+        Self: Sized,
+    {
+        let trailers: String = row.get("trailers")?;
+        let state: String = row.get("state")?;
+        Ok(Self {
+            id: row.get("id")?,
+            model: row.get("model")?,
+            workspace_id: row.get("workspace_id")?,
+            request_id: row.get("request_id")?,
+            created_at: row.get("created_at")?,
+            updated_at: row.get("updated_at")?,
+            service: row.get("service")?,
+            method: row.get("method")?,
+            elapsed: row.get("elapsed")?,
+            state: serde_json::from_str(format!(r#""{state}""#).as_str()).unwrap(),
+            status: row.get("status")?,
+            url: row.get("url")?,
+            error: row.get("error")?,
+            trailers: serde_json::from_str(trailers.as_str()).unwrap_or_default(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "gen_models.ts")]
+pub enum GrpcEventType {
+    Info,
+    Error,
+    ClientMessage,
+    ServerMessage,
+    ConnectionStart,
+    ConnectionEnd,
+}
+
+impl Default for GrpcEventType {
+    fn default() -> Self {
+        GrpcEventType::Info
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, TS)]
+#[serde(default, rename_all = "camelCase")]
+#[ts(export, export_to = "gen_models.ts")]
+#[enum_def(table_name = "grpc_events")]
+pub struct GrpcEvent {
+    #[ts(type = "\"grpc_event\"")]
+    pub model: String,
+    pub id: String,
+    pub created_at: NaiveDateTime,
+    pub updated_at: NaiveDateTime,
+    pub workspace_id: String,
+    pub request_id: String,
+    pub connection_id: String,
+
+    pub content: String,
+    pub error: Option<String>,
+    pub event_type: GrpcEventType,
+    pub metadata: BTreeMap<String, String>,
+    pub status: Option<i32>,
+}
+
+impl UpsertModelInfo for GrpcEvent {
+    fn table_name() -> impl IntoTableRef + IntoIden {
+        GrpcEventIden::Table
+    }
+
+    fn id_column() -> impl IntoIden + Eq + Clone {
+        GrpcEventIden::Id
+    }
+
+    fn generate_id() -> String {
+        generate_prefixed_id("ge")
+    }
+
+    fn order_by() -> (impl IntoColumnRef, Order) {
+        (GrpcEventIden::CreatedAt, Desc)
+    }
+
+    fn get_id(&self) -> String {
+        self.id.clone()
+    }
+
+    fn insert_values(
+        self,
+        source: &UpdateSource,
+    ) -> DbResult<Vec<(impl IntoIden + Eq, impl Into<SimpleExpr>)>> {
+        use GrpcEventIden::*;
+        Ok(vec![
+            (CreatedAt, upsert_date(source, self.created_at)),
+            (UpdatedAt, upsert_date(source, self.updated_at)),
+            (WorkspaceId, self.workspace_id.into()),
+            (RequestId, self.request_id.into()),
+            (ConnectionId, self.connection_id.into()),
+            (Content, self.content.into()),
+            (EventType, serde_json::to_string(&self.event_type)?.into()),
+            (Metadata, serde_json::to_string(&self.metadata)?.into()),
+            (Status, self.status.into()),
+            (Error, self.error.into()),
+        ])
+    }
+
+    fn update_columns() -> Vec<impl IntoIden> {
+        vec![
+            GrpcEventIden::UpdatedAt,
+            GrpcEventIden::Content,
+            GrpcEventIden::EventType,
+            GrpcEventIden::Metadata,
+            GrpcEventIden::Status,
+            GrpcEventIden::Error,
+        ]
+    }
+
+    fn from_row(row: &Row) -> rusqlite::Result<Self>
+    where
+        Self: Sized,
+    {
+        let event_type: String = row.get("event_type")?;
+        let metadata: String = row.get("metadata")?;
+        Ok(Self {
+            id: row.get("id")?,
+            model: row.get("model")?,
+            workspace_id: row.get("workspace_id")?,
+            request_id: row.get("request_id")?,
+            connection_id: row.get("connection_id")?,
+            created_at: row.get("created_at")?,
+            updated_at: row.get("updated_at")?,
+            content: row.get("content")?,
+            event_type: serde_json::from_str(event_type.as_str()).unwrap_or_default(),
+            metadata: serde_json::from_str(metadata.as_str()).unwrap_or_default(),
+            status: row.get("status")?,
+            error: row.get("error")?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, TS)]
+#[serde(default, rename_all = "camelCase")]
+#[ts(export, export_to = "gen_models.ts")]
+#[enum_def(table_name = "plugins")]
+pub struct Plugin {
+    #[ts(type = "\"plugin\"")]
+    pub model: String,
+    pub id: String,
+    pub created_at: NaiveDateTime,
+    pub updated_at: NaiveDateTime,
+
+    pub checked_at: Option<NaiveDateTime>,
+    pub directory: String,
+    pub enabled: bool,
+    pub url: Option<String>,
+    pub source: PluginSource,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "gen_models.ts")]
+pub enum PluginSource {
+    Bundled,
+    Filesystem,
+    Registry,
+}
+
+impl FromStr for PluginSource {
+    type Err = crate::error::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "bundled" => Ok(Self::Bundled),
+            "filesystem" => Ok(Self::Filesystem),
+            "registry" => Ok(Self::Registry),
+            _ => Ok(Self::default()),
+        }
+    }
+}
+
+impl Display for PluginSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let str = match self {
+            PluginSource::Bundled => "bundled".to_string(),
+            PluginSource::Filesystem => "filesystem".to_string(),
+            PluginSource::Registry => "registry".to_string(),
+        };
+        write!(f, "{}", str)
+    }
+}
+
+impl Default for PluginSource {
+    fn default() -> Self {
+        Self::Filesystem
+    }
+}
+
+impl UpsertModelInfo for Plugin {
+    fn table_name() -> impl IntoTableRef + IntoIden {
+        PluginIden::Table
+    }
+
+    fn id_column() -> impl IntoIden + Eq + Clone {
+        PluginIden::Id
+    }
+
+    fn generate_id() -> String {
+        generate_prefixed_id("pg")
+    }
+
+    fn order_by() -> (impl IntoColumnRef, Order) {
+        (PluginIden::CreatedAt, Desc)
+    }
+
+    fn get_id(&self) -> String {
+        self.id.clone()
+    }
+
+    fn insert_values(
+        self,
+        source: &UpdateSource,
+    ) -> DbResult<Vec<(impl IntoIden + Eq, impl Into<SimpleExpr>)>> {
+        use PluginIden::*;
+        Ok(vec![
+            (CreatedAt, upsert_date(source, self.created_at)),
+            (UpdatedAt, upsert_date(source, self.updated_at)),
+            (CheckedAt, self.checked_at.into()),
+            (Directory, self.directory.into()),
+            (Url, self.url.into()),
+            (Enabled, self.enabled.into()),
+            (Source, self.source.to_string().into()),
+        ])
+    }
+
+    fn update_columns() -> Vec<impl IntoIden> {
+        vec![
+            PluginIden::UpdatedAt,
+            PluginIden::CheckedAt,
+            PluginIden::Directory,
+            PluginIden::Url,
+            PluginIden::Enabled,
+            PluginIden::Source,
+        ]
+    }
+
+    fn from_row(row: &Row) -> rusqlite::Result<Self>
+    where
+        Self: Sized,
+    {
+        Ok(Self {
+            id: row.get("id")?,
+            model: row.get("model")?,
+            created_at: row.get("created_at")?,
+            updated_at: row.get("updated_at")?,
+            checked_at: row.get("checked_at")?,
+            url: row.get("url")?,
+            directory: row.get("directory")?,
+            enabled: row.get("enabled")?,
+            source: PluginSource::from_str(row.get::<_, String>("source")?.as_str()).unwrap(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default, TS)]
+#[serde(default, rename_all = "camelCase")]
+#[ts(export, export_to = "gen_models.ts")]
+#[enum_def(table_name = "sync_states")]
+pub struct SyncState {
+    #[ts(type = "\"sync_state\"")]
+    pub model: String,
+    pub id: String,
+    pub workspace_id: String,
+    pub created_at: NaiveDateTime,
+    pub updated_at: NaiveDateTime,
+    pub flushed_at: NaiveDateTime,
+
+    pub model_id: String,
+    pub checksum: String,
+    pub rel_path: String,
+    pub sync_dir: String,
+}
+
+impl UpsertModelInfo for SyncState {
+    fn table_name() -> impl IntoTableRef + IntoIden {
+        SyncStateIden::Table
+    }
+
+    fn id_column() -> impl IntoIden + Eq + Clone {
+        SyncStateIden::Id
+    }
+
+    fn generate_id() -> String {
+        generate_prefixed_id("ss")
+    }
+
+    fn order_by() -> (impl IntoColumnRef, Order) {
+        (SyncStateIden::CreatedAt, Desc)
+    }
+
+    fn get_id(&self) -> String {
+        self.id.clone()
+    }
+
+    fn insert_values(
+        self,
+        source: &UpdateSource,
+    ) -> DbResult<Vec<(impl IntoIden + Eq, impl Into<SimpleExpr>)>> {
+        use SyncStateIden::*;
+        Ok(vec![
+            (CreatedAt, upsert_date(source, self.created_at)),
+            (UpdatedAt, upsert_date(source, self.updated_at)),
+            (WorkspaceId, self.workspace_id.into()),
+            (FlushedAt, self.flushed_at.into()),
+            (Checksum, self.checksum.into()),
+            (ModelId, self.model_id.into()),
+            (RelPath, self.rel_path.into()),
+            (SyncDir, self.sync_dir.into()),
+        ])
+    }
+
+    fn update_columns() -> Vec<impl IntoIden> {
+        vec![
+            SyncStateIden::UpdatedAt,
+            SyncStateIden::FlushedAt,
+            SyncStateIden::Checksum,
+            SyncStateIden::RelPath,
+            SyncStateIden::SyncDir,
+        ]
+    }
+
+    fn from_row(row: &Row) -> rusqlite::Result<Self>
+    where
+        Self: Sized,
+    {
+        Ok(Self {
+            id: row.get("id")?,
+            workspace_id: row.get("workspace_id")?,
+            model: row.get("model")?,
+            created_at: row.get("created_at")?,
+            updated_at: row.get("updated_at")?,
+            flushed_at: row.get("flushed_at")?,
+            checksum: row.get("checksum")?,
+            model_id: row.get("model_id")?,
+            sync_dir: row.get("sync_dir")?,
+            rel_path: row.get("rel_path")?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, TS)]
+#[serde(default, rename_all = "camelCase")]
+#[ts(export, export_to = "gen_models.ts")]
+#[enum_def(table_name = "key_values")]
+pub struct KeyValue {
+    #[ts(type = "\"key_value\"")]
+    pub model: String,
+    pub id: String,
+    pub created_at: NaiveDateTime,
+    pub updated_at: NaiveDateTime,
+
+    pub key: String,
+    pub namespace: String,
+    pub value: String,
+}
+
+impl UpsertModelInfo for KeyValue {
+    fn table_name() -> impl IntoTableRef + IntoIden {
+        KeyValueIden::Table
+    }
+
+    fn id_column() -> impl IntoIden + Eq + Clone {
+        KeyValueIden::Id
+    }
+
+    fn generate_id() -> String {
+        generate_prefixed_id("kv")
+    }
+
+    fn order_by() -> (impl IntoColumnRef, Order) {
+        (KeyValueIden::CreatedAt, Desc)
+    }
+
+    fn get_id(&self) -> String {
+        self.id.clone()
+    }
+
+    fn insert_values(
+        self,
+        source: &UpdateSource,
+    ) -> DbResult<Vec<(impl IntoIden + Eq, impl Into<SimpleExpr>)>> {
+        use KeyValueIden::*;
+        Ok(vec![
+            (CreatedAt, upsert_date(source, self.created_at)),
+            (UpdatedAt, upsert_date(source, self.updated_at)),
+            (Namespace, self.namespace.clone().into()),
+            (Key, self.key.clone().into()),
+            (Value, self.value.clone().into()),
+        ])
+    }
+
+    fn update_columns() -> Vec<impl IntoIden> {
+        vec![KeyValueIden::UpdatedAt, KeyValueIden::Value]
+    }
+
+    fn from_row(row: &Row) -> rusqlite::Result<Self>
+    where
+        Self: Sized,
+    {
+        Ok(Self {
+            id: row.get("id")?,
+            model: row.get("model")?,
+            created_at: row.get("created_at")?,
+            updated_at: row.get("updated_at")?,
+            namespace: row.get("namespace")?,
+            key: row.get("key")?,
+            value: row.get("value")?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, TS)]
+#[serde(default, rename_all = "camelCase")]
+#[ts(export, export_to = "gen_models.ts")]
+#[enum_def(table_name = "plugin_key_values")]
+pub struct PluginKeyValue {
+    #[ts(type = "\"plugin_key_value\"")]
+    pub model: String,
+    pub created_at: NaiveDateTime,
+    pub updated_at: NaiveDateTime,
+
+    pub plugin_name: String,
+    pub key: String,
+    pub value: String,
+}
+
+impl<'s> TryFrom<&Row<'s>> for PluginKeyValue {
+    type Error = rusqlite::Error;
+
+    fn try_from(r: &Row<'s>) -> std::result::Result<Self, Self::Error> {
+        Ok(Self {
+            model: r.get("model")?,
+            created_at: r.get("created_at")?,
+            updated_at: r.get("updated_at")?,
+            plugin_name: r.get("plugin_name")?,
+            key: r.get("key")?,
+            value: r.get("value")?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, TS)]
+#[serde(default, rename_all = "camelCase")]
+#[ts(export, export_to = "gen_models.ts")]
+#[enum_def(table_name = "import_sources")]
+pub struct ImportSource {
+    #[ts(type = "\"import_source\"")]
+    pub model: String,
+    pub id: String,
+    pub created_at: NaiveDateTime,
+    pub updated_at: NaiveDateTime,
+    pub workspace_id: String,
+
+    pub importer: String,
+    pub origin: String,
+    pub origin_label: String,
+    pub last_imported_at: NaiveDateTime,
+}
+
+impl UpsertModelInfo for ImportSource {
+    fn table_name() -> impl IntoTableRef + IntoIden {
+        ImportSourceIden::Table
+    }
+
+    fn id_column() -> impl IntoIden + Eq + Clone {
+        ImportSourceIden::Id
+    }
+
+    fn generate_id() -> String {
+        generate_prefixed_id("im")
+    }
+
+    fn order_by() -> (impl IntoColumnRef, Order) {
+        (ImportSourceIden::CreatedAt, Desc)
+    }
+
+    fn get_id(&self) -> String {
+        self.id.clone()
+    }
+
+    fn insert_values(
+        self,
+        source: &UpdateSource,
+    ) -> DbResult<Vec<(impl IntoIden + Eq, impl Into<SimpleExpr>)>> {
+        use ImportSourceIden::*;
+        Ok(vec![
+            (CreatedAt, upsert_date(source, self.created_at)),
+            (UpdatedAt, upsert_date(source, self.updated_at)),
+            (WorkspaceId, self.workspace_id.into()),
+            (Importer, self.importer.into()),
+            (Origin, self.origin.into()),
+            (OriginLabel, self.origin_label.into()),
+            (LastImportedAt, self.last_imported_at.into()),
+        ])
+    }
+
+    fn update_columns() -> Vec<impl IntoIden> {
+        vec![
+            ImportSourceIden::UpdatedAt,
+            ImportSourceIden::Importer,
+            ImportSourceIden::Origin,
+            ImportSourceIden::OriginLabel,
+            ImportSourceIden::LastImportedAt,
+        ]
+    }
+
+    fn from_row(row: &Row) -> rusqlite::Result<Self>
+    where
+        Self: Sized,
+    {
+        Ok(Self {
+            id: row.get("id")?,
+            model: row.get("model")?,
+            created_at: row.get("created_at")?,
+            updated_at: row.get("updated_at")?,
+            workspace_id: row.get("workspace_id")?,
+            importer: row.get("importer")?,
+            origin: row.get("origin")?,
+            origin_label: row.get("origin_label")?,
+            last_imported_at: row.get("last_imported_at")?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, TS)]
+#[serde(default, rename_all = "camelCase")]
+#[ts(export, export_to = "gen_models.ts")]
+#[enum_def(table_name = "import_source_resources")]
+pub struct ImportSourceResource {
+    #[ts(type = "\"import_source_resource\"")]
+    pub model: String,
+    pub created_at: NaiveDateTime,
+    pub updated_at: NaiveDateTime,
+
+    pub import_source_id: String,
+    pub source_key: String,
+    pub model_type: String,
+    /// `None` once the user has decided not to import this key
+    #[ts(optional)]
+    pub model_id: Option<String>,
+    /// Hash of the resource as last applied or decided from the source, if one was recorded
+    #[ts(optional)]
+    pub content_hash: Option<String>,
+}
+
+impl<'s> TryFrom<&Row<'s>> for ImportSourceResource {
+    type Error = rusqlite::Error;
+
+    fn try_from(r: &Row<'s>) -> std::result::Result<Self, Self::Error> {
+        Ok(Self {
+            model: r.get("model")?,
+            created_at: r.get("created_at")?,
+            updated_at: r.get("updated_at")?,
+            import_source_id: r.get("import_source_id")?,
+            source_key: r.get("source_key")?,
+            model_type: r.get("model_type")?,
+            model_id: r.get("model_id")?,
+            content_hash: r.get("content_hash")?,
+        })
+    }
+}
+
+/// Only used as a `from_row` fallback for an unparseable settings column. The
+/// value a *new* model gets comes from that model's `Default` impl.
+fn default_request_message_size_setting() -> InheritedIntSetting {
+    InheritedIntSetting { enabled: false, value: DEFAULT_REQUEST_MESSAGE_SIZE }
+}
+
+#[macro_export]
+macro_rules! define_any_model {
+    ($($type:ident),* $(,)?) => {
+        #[derive(Debug, Clone, Serialize, TS)]
+        #[serde(rename_all = "camelCase", untagged)]
+        #[ts(export, export_to = "gen_models.ts")]
+        pub enum AnyModel {
+            $(
+                $type($type),
+            )*
+        }
+
+        impl AnyModel {
+            #[inline]
+            pub fn id(&self) -> &str {
+                match self {
+                    $(
+                        AnyModel::$type(inner) => &inner.id,
+                    )*
+                }
+            }
+
+            #[inline]
+            pub fn model(&self) -> &str {
+                match self {
+                    $(
+                        AnyModel::$type(inner) => &inner.model,
+                    )*
+                }
+            }
+        }
+
+        $(
+            impl From<$type> for AnyModel {
+                fn from(value: $type) -> Self {
+                    AnyModel::$type(value)
+                }
+            }
+
+            impl From<AnyModel> for $type {
+                fn from(value: AnyModel) -> $type {
+                    match value {
+                        AnyModel::$type(inner) => inner,
+                        _ => panic!( // Should never happen because this macro also generates the enum variant
+                            "Tried to convert AnyModel into `{}`, but found a different variant",
+                            stringify!($type)
+                        ),
+                    }
+                }
+            }
+        )*
+    };
+}
+
+define_any_model! {
+    CookieJar,
+    Environment,
+    Folder,
+    GraphQlIntrospection,
+    GrpcConnection,
+    GrpcEvent,
+    GrpcRequest,
+    HttpRequest,
+    HttpResponse,
+    HttpResponseEvent,
+    ImportSource,
+    KeyValue,
+    Plugin,
+    Settings,
+    SyncState,
+    WebsocketConnection,
+    WebsocketEvent,
+    WebsocketRequest,
+    Workspace,
+    WorkspaceMeta,
+}
+
+impl<'de> Deserialize<'de> for AnyModel {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        let model = value.as_object().unwrap();
+        use AnyModel::*;
+        use serde_json::from_value as fv;
+
+        let model = match model.get("model") {
+            Some(m) if m == "cookie_jar" => CookieJar(fv(value).unwrap()),
+            Some(m) if m == "environment" => Environment(fv(value).unwrap()),
+            Some(m) if m == "folder" => Folder(fv(value).unwrap()),
+            Some(m) if m == "graphql_introspection" => GraphQlIntrospection(fv(value).unwrap()),
+            Some(m) if m == "grpc_connection" => GrpcConnection(fv(value).unwrap()),
+            Some(m) if m == "grpc_event" => GrpcEvent(fv(value).unwrap()),
+            Some(m) if m == "grpc_request" => GrpcRequest(fv(value).unwrap()),
+            Some(m) if m == "http_request" => HttpRequest(fv(value).unwrap()),
+            Some(m) if m == "http_response" => HttpResponse(fv(value).unwrap()),
+            Some(m) if m == "http_response_event" => HttpResponseEvent(fv(value).unwrap()),
+            Some(m) if m == "import_source" => ImportSource(fv(value).unwrap()),
+            Some(m) if m == "key_value" => KeyValue(fv(value).unwrap()),
+            Some(m) if m == "plugin" => Plugin(fv(value).unwrap()),
+            Some(m) if m == "settings" => Settings(fv(value).unwrap()),
+            Some(m) if m == "sync_state" => SyncState(fv(value).unwrap()),
+            Some(m) if m == "websocket_connection" => WebsocketConnection(fv(value).unwrap()),
+            Some(m) if m == "websocket_event" => WebsocketEvent(fv(value).unwrap()),
+            Some(m) if m == "websocket_request" => WebsocketRequest(fv(value).unwrap()),
+            Some(m) if m == "workspace" => Workspace(fv(value).unwrap()),
+            Some(m) if m == "workspace_meta" => WorkspaceMeta(fv(value).unwrap()),
+            Some(m) => {
+                return Err(serde::de::Error::custom(format!(
+                    "Failed to deserialize AnyModel {}",
+                    m
+                )));
+            }
+            None => {
+                return Err(serde::de::Error::custom("Missing or invalid model"));
+            }
+        };
+
+        Ok(model)
+    }
+}
+
+impl AnyModel {
+    pub fn resolved_name(&self) -> String {
+        let compute_name = |name: &str, url: &str, fallback: &str| -> String {
+            if !name.is_empty() {
+                return name.to_string();
+            }
+            let without_variables = url.replace(r"\$\{\[\s*([^\]\s]+)\s*]}", "$1");
+            if without_variables.is_empty() { fallback.to_string() } else { without_variables }
+        };
+
+        match self.clone() {
+            AnyModel::CookieJar(v) => v.name,
+            AnyModel::Environment(v) => v.name,
+            AnyModel::Folder(v) => v.name,
+            AnyModel::GrpcRequest(v) => compute_name(&v.name, &v.url, "gRPC Request"),
+            AnyModel::HttpRequest(v) => compute_name(&v.name, &v.url, "HTTP Request"),
+            AnyModel::WebsocketRequest(v) => compute_name(&v.name, &v.url, "WebSocket Request"),
+            AnyModel::Workspace(v) => v.name,
+            _ => "No Name".to_string(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every model below carries `#[serde(default)]` at the container level, so a
+    /// missing key is filled from `Default::default()`, which makes each `Default`
+    /// impl the single definition of that model's defaults.
+    ///
+    /// Deserializing `{}` therefore equals `Default::default()` by construction
+    /// today. What this catches is the two ways that can come apart again, both of
+    /// which have already bitten us:
+    ///
+    /// 1. A field-level `#[serde(default = "...")]` (or bare `#[serde(default)]`)
+    ///    added back on a field whose `Default` says something else. That is exactly
+    ///    the shape of the bug this replaced: `setting_send_cookies` deserialized as
+    ///    true but a derived `Default` produced false, so the bootstrapped workspace
+    ///    silently sent no cookies.
+    /// 2. The container-level `#[serde(default)]` being dropped, which turns every
+    ///    missing key into a deserialization error instead.
+    macro_rules! assert_default_matches_serde {
+        ($($t:ty),+ $(,)?) => {
+            $(
+                assert_eq!(
+                    serde_json::from_str::<$t>("{}").expect(concat!(
+                        stringify!($t),
+                        " must deserialize from an empty object"
+                    )),
+                    <$t>::default(),
+                    concat!(stringify!($t), ": Default::default() disagrees with its serde defaults"),
+                );
+            )+
+        };
+    }
+
+    #[test]
+    fn defaults_match_serde_defaults() {
+        assert_default_matches_serde!(
+            Workspace,
+            HttpRequest,
+            Folder,
+            GrpcRequest,
+            WebsocketRequest,
+            HttpRequestHeader,
+            HttpUrlParameter,
+            EnvironmentVariable,
+            DnsOverride,
+            ClientCertificate,
+            InheritedBoolSetting,
+            InheritedIntSetting,
+        );
+    }
+
+    #[test]
+    fn defaults_carry_their_model_name() {
+        assert_eq!(Workspace::default().model, "workspace");
+        assert_eq!(HttpRequest::default().model, "http_request");
+        assert_eq!(Folder::default().model, "folder");
+        assert_eq!(GrpcRequest::default().model, "grpc_request");
+        assert_eq!(WebsocketRequest::default().model, "websocket_request");
+    }
+}

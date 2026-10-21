@@ -1,0 +1,17 @@
+{
+  "compilerOptions": {
+    "module": "node16",
+    "strict": true,
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "target": "es2021",
+    "lib": ["es2021"],
+    "noImplicitAny": false,
+    "moduleResolution": "node16",
+    "resolveJsonModule": true,
+    "sourceMap": true,
+    "rootDir": "src",
+    "outDir": "build"
+  },
+  "include": ["src"]
+}

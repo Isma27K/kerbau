@@ -1,0 +1,14 @@
+{
+  "name": "@yaak/template-function-uuid",
+  "displayName": "UUID Template Functions",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Template functions for generating UUIDs",
+  "scripts": {
+    "build": "yaakcli build",
+    "dev": "yaakcli dev"
+  },
+  "dependencies": {
+    "uuid": "^14.0.3"
+  }
+}

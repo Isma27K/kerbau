@@ -1,0 +1,69 @@
+import type { Context } from "@yaakapp/api";
+import type { CustomParams } from "../customParams";
+import { NO_CUSTOM_PARAMS } from "../customParams";
+import { fetchAccessToken } from "../fetchAccessToken";
+import { getOrRefreshAccessToken } from "../getOrRefreshAccessToken";
+import type { AccessToken, TokenStoreArgs } from "../store";
+import { storeToken } from "../store";
+
+export async function getPassword(
+  ctx: Context,
+  contextId: string,
+  {
+    accessTokenUrl,
+    clientId,
+    clientSecret,
+    username,
+    password,
+    credentialsInBody,
+    audience,
+    scope,
+    customParams = NO_CUSTOM_PARAMS,
+  }: {
+    accessTokenUrl: string;
+    clientId: string;
+    clientSecret: string;
+    username: string;
+    password: string;
+    scope: string | null;
+    audience: string | null;
+    credentialsInBody: boolean;
+    customParams?: CustomParams;
+  },
+): Promise<AccessToken> {
+  const tokenArgs: TokenStoreArgs = {
+    contextId,
+    clientId,
+    accessTokenUrl,
+    authorizationUrl: null,
+    username,
+  };
+  const token = await getOrRefreshAccessToken(ctx, tokenArgs, {
+    accessTokenUrl,
+    scope,
+    clientId,
+    clientSecret,
+    credentialsInBody,
+    custom: customParams.refresh,
+  });
+  if (token != null) {
+    return token;
+  }
+
+  const response = await fetchAccessToken(ctx, {
+    accessTokenUrl,
+    clientId,
+    clientSecret,
+    scope,
+    audience,
+    grantType: "password",
+    credentialsInBody,
+    params: [
+      { name: "username", value: username },
+      { name: "password", value: password },
+    ],
+    custom: customParams.token,
+  });
+
+  return storeToken(ctx, tokenArgs, response);
+}

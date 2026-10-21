@@ -1,0 +1,15 @@
+{
+  "name": "@yaak/importer-insomnia",
+  "displayName": "Insomnia Importer",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Import data from Insomnia",
+  "scripts": {
+    "build": "yaakcli build",
+    "dev": "yaakcli dev",
+    "test": "vp test --run tests"
+  },
+  "dependencies": {
+    "yaml": "^2.8.3"
+  }
+}

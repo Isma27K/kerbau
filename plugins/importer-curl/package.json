@@ -1,0 +1,15 @@
+{
+  "name": "@yaak/importer-curl",
+  "displayName": "cURL Importer",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Import requests from cURL commands",
+  "scripts": {
+    "build": "yaakcli build",
+    "dev": "yaakcli dev",
+    "test": "vp test --run tests"
+  },
+  "dependencies": {
+    "shlex": "^3.0.0"
+  }
+}

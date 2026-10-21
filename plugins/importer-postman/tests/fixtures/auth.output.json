@@ -1,0 +1,421 @@
+{
+  "resources": {
+    "workspaces": [
+      {
+        "model": "workspace",
+        "id": "GENERATE_ID::WORKSPACE_0",
+        "name": "Authentication",
+        "authenticationType": "basic",
+        "authentication": {
+          "username": "workspace",
+          "password": "workspace_secret"
+        }
+      }
+    ],
+    "environments": [
+      {
+        "model": "environment",
+        "id": "GENERATE_ID::ENVIRONMENT_0",
+        "name": "Global Variables",
+        "workspaceId": "GENERATE_ID::WORKSPACE_0",
+        "parentModel": "workspace",
+        "parentId": null,
+        "variables": [
+          {
+            "name": "COLLECTION VARIABLE",
+            "value": "collection variable"
+          }
+        ]
+      }
+    ],
+    "httpRequests": [
+      {
+        "model": "http_request",
+        "id": "GENERATE_ID::HTTP_REQUEST_0",
+        "workspaceId": "GENERATE_ID::WORKSPACE_0",
+        "folderId": null,
+        "name": "No Auth",
+        "method": "GET",
+        "url": "https://yaak.app/x/echo",
+        "urlParameters": [],
+        "body": {},
+        "bodyType": null,
+        "sortPriority": 0,
+        "headers": [],
+        "authenticationType": "none",
+        "authentication": {}
+      },
+      {
+        "model": "http_request",
+        "id": "GENERATE_ID::HTTP_REQUEST_1",
+        "workspaceId": "GENERATE_ID::WORKSPACE_0",
+        "folderId": null,
+        "name": "Inherit",
+        "method": "GET",
+        "url": "https://yaak.app/x/echo",
+        "urlParameters": [],
+        "body": {},
+        "bodyType": null,
+        "sortPriority": 1,
+        "headers": [],
+        "authenticationType": null,
+        "authentication": {}
+      },
+      {
+        "model": "http_request",
+        "id": "GENERATE_ID::HTTP_REQUEST_2",
+        "workspaceId": "GENERATE_ID::WORKSPACE_0",
+        "folderId": null,
+        "name": "OAuth 2 Auth Code",
+        "method": "GET",
+        "url": "${[hello]}",
+        "urlParameters": [],
+        "body": {
+          "text": "{\n    \"hello\": \"world\"\n}"
+        },
+        "bodyType": "application/json",
+        "sortPriority": 2,
+        "headers": [
+          {
+            "name": "Content-Type",
+            "value": "application/json",
+            "enabled": true
+          }
+        ],
+        "authenticationType": "oauth2",
+        "authentication": {
+          "name": "oauth2",
+          "grantType": "authorization_code",
+          "clientId": "cliend id",
+          "headerPrefix": "Bearer",
+          "scope": "scope",
+          "clientSecret": "clientsecet",
+          "authorizationUrl": "https://github.com/login/oauth/authorize",
+          "accessTokenUrl": "https://github.com/login/oauth/access_token",
+          "redirectUri": "https://callback",
+          "state": "state"
+        }
+      },
+      {
+        "model": "http_request",
+        "id": "GENERATE_ID::HTTP_REQUEST_3",
+        "workspaceId": "GENERATE_ID::WORKSPACE_0",
+        "folderId": null,
+        "name": "OAuth 2 Auth Code (PKCE)",
+        "method": "GET",
+        "url": "${[hello]}",
+        "urlParameters": [],
+        "body": {
+          "text": "{\n    \"hello\": \"world\"\n}"
+        },
+        "bodyType": "application/json",
+        "sortPriority": 3,
+        "headers": [
+          {
+            "name": "Content-Type",
+            "value": "application/json",
+            "enabled": true
+          }
+        ],
+        "authenticationType": "oauth2",
+        "authentication": {
+          "name": "oauth2",
+          "grantType": "authorization_code",
+          "clientId": "cliend id",
+          "headerPrefix": "Bearer",
+          "scope": "scope",
+          "clientSecret": "clientsecet",
+          "authorizationUrl": "https://github.com/login/oauth/authorize",
+          "accessTokenUrl": "https://github.com/login/oauth/access_token",
+          "redirectUri": "https://callback",
+          "state": "state",
+          "usePkce": true,
+          "pkceChallengeMethod": "S256",
+          "pkceCodeVerifier": "verifier"
+        }
+      },
+      {
+        "model": "http_request",
+        "id": "GENERATE_ID::HTTP_REQUEST_4",
+        "workspaceId": "GENERATE_ID::WORKSPACE_0",
+        "folderId": null,
+        "name": "OAuth 2 Implicit",
+        "method": "GET",
+        "url": "${[hello]}",
+        "urlParameters": [],
+        "body": {
+          "text": "{\n    \"hello\": \"world\"\n}"
+        },
+        "bodyType": "application/json",
+        "sortPriority": 4,
+        "headers": [
+          {
+            "name": "Content-Type",
+            "value": "application/json",
+            "enabled": true
+          }
+        ],
+        "authenticationType": "oauth2",
+        "authentication": {
+          "name": "oauth2",
+          "grantType": "implicit",
+          "clientId": "cliend id",
+          "headerPrefix": "Bearer",
+          "scope": "scope",
+          "authorizationUrl": "https://github.com/login/oauth/authorize",
+          "redirectUri": "https://yaak.app/x/echo",
+          "state": "state"
+        }
+      },
+      {
+        "model": "http_request",
+        "id": "GENERATE_ID::HTTP_REQUEST_5",
+        "workspaceId": "GENERATE_ID::WORKSPACE_0",
+        "folderId": null,
+        "name": "OAuth 2 Password",
+        "method": "GET",
+        "url": "${[hello]}",
+        "urlParameters": [],
+        "body": {
+          "text": "{\n    \"hello\": \"world\"\n}"
+        },
+        "bodyType": "application/json",
+        "sortPriority": 5,
+        "headers": [
+          {
+            "name": "Content-Type",
+            "value": "application/json",
+            "enabled": true
+          }
+        ],
+        "authenticationType": "oauth2",
+        "authentication": {
+          "name": "oauth2",
+          "grantType": "password",
+          "clientId": "clientid",
+          "headerPrefix": "Bearer",
+          "scope": "scope",
+          "clientSecret": "clientsecret",
+          "accessTokenUrl": "https://github.com/login/oauth/access_token",
+          "username": "username",
+          "password": "password"
+        }
+      },
+      {
+        "model": "http_request",
+        "id": "GENERATE_ID::HTTP_REQUEST_6",
+        "workspaceId": "GENERATE_ID::WORKSPACE_0",
+        "folderId": null,
+        "name": "OAuth 2 Client Credentials",
+        "method": "GET",
+        "url": "${[hello]}",
+        "urlParameters": [],
+        "body": {
+          "text": "{\n    \"hello\": \"world\"\n}"
+        },
+        "bodyType": "application/json",
+        "sortPriority": 6,
+        "headers": [
+          {
+            "name": "Content-Type",
+            "value": "application/json",
+            "enabled": true
+          }
+        ],
+        "authenticationType": "oauth2",
+        "authentication": {
+          "name": "oauth2",
+          "grantType": "client_credentials",
+          "clientId": "clientid",
+          "headerPrefix": "Bearer",
+          "scope": "scope",
+          "clientSecret": "clientsecret",
+          "accessTokenUrl": "https://github.com/login/oauth/access_token"
+        }
+      },
+      {
+        "model": "http_request",
+        "id": "GENERATE_ID::HTTP_REQUEST_7",
+        "workspaceId": "GENERATE_ID::WORKSPACE_0",
+        "folderId": null,
+        "name": "AWS V4",
+        "method": "GET",
+        "url": "https://yaak.app/x/echo",
+        "urlParameters": [],
+        "body": {},
+        "bodyType": null,
+        "sortPriority": 7,
+        "headers": [],
+        "authenticationType": "awsv4",
+        "authentication": {
+          "accessKeyId": "access",
+          "secretAccessKey": "secret",
+          "sessionToken": "session",
+          "region": "us-west-1",
+          "service": "s3"
+        }
+      },
+      {
+        "model": "http_request",
+        "id": "GENERATE_ID::HTTP_REQUEST_8",
+        "workspaceId": "GENERATE_ID::WORKSPACE_0",
+        "folderId": null,
+        "name": "API Key",
+        "method": "GET",
+        "url": "https://yaak.app/x/echo",
+        "urlParameters": [],
+        "body": {},
+        "bodyType": null,
+        "sortPriority": 8,
+        "headers": [],
+        "authenticationType": "apikey",
+        "authentication": {
+          "location": "query",
+          "key": "X-API-Key",
+          "value": "secret-123"
+        }
+      },
+      {
+        "model": "http_request",
+        "id": "GENERATE_ID::HTTP_REQUEST_9",
+        "workspaceId": "GENERATE_ID::WORKSPACE_0",
+        "folderId": null,
+        "name": "JWT",
+        "method": "GET",
+        "url": "https://yaak.app/x/echo",
+        "urlParameters": [],
+        "body": {},
+        "bodyType": null,
+        "sortPriority": 9,
+        "headers": [],
+        "authenticationType": "jwt",
+        "authentication": {
+          "algorithm": "HS384",
+          "secret": "mysecret",
+          "secretBase64": false,
+          "payload": "{\n    \"my\": \"payload\"\n}",
+          "headerPrefix": "Bearer",
+          "location": "header"
+        }
+      },
+      {
+        "model": "http_request",
+        "id": "GENERATE_ID::HTTP_REQUEST_10",
+        "workspaceId": "GENERATE_ID::WORKSPACE_0",
+        "folderId": null,
+        "name": "Digest",
+        "method": "GET",
+        "url": "https://yaak.app/x/echo",
+        "urlParameters": [],
+        "body": {},
+        "bodyType": null,
+        "sortPriority": 10,
+        "headers": [],
+        "authenticationType": "digest",
+        "authentication": {
+          "username": "digest-user",
+          "password": "digest-pass",
+          "realm": "testrealm@yaak.app"
+        }
+      },
+      {
+        "model": "http_request",
+        "id": "GENERATE_ID::HTTP_REQUEST_11",
+        "workspaceId": "GENERATE_ID::WORKSPACE_0",
+        "folderId": null,
+        "name": "NTLM",
+        "method": "GET",
+        "url": "https://yaak.app/x/echo",
+        "urlParameters": [],
+        "body": {},
+        "bodyType": null,
+        "sortPriority": 11,
+        "headers": [],
+        "authenticationType": "windows",
+        "authentication": {
+          "username": "ntlm-user",
+          "password": "ntlm-pass",
+          "domain": "CORP",
+          "workstation": "WORKSTATION-01"
+        }
+      },
+      {
+        "model": "http_request",
+        "id": "GENERATE_ID::HTTP_REQUEST_12",
+        "workspaceId": "GENERATE_ID::WORKSPACE_0",
+        "folderId": null,
+        "name": "OAuth 1",
+        "method": "GET",
+        "url": "https://yaak.app/x/echo",
+        "urlParameters": [],
+        "body": {},
+        "bodyType": null,
+        "sortPriority": 12,
+        "headers": [],
+        "authenticationType": "oauth1",
+        "authentication": {
+          "signatureMethod": "HMAC-SHA256",
+          "consumerKey": "consumer-key",
+          "consumerSecret": "consumer-secret",
+          "tokenKey": "access-token",
+          "tokenSecret": "token-secret",
+          "callback": "https://yaak.app/x/callback",
+          "verifier": "verifier-123",
+          "timestamp": "1700000000",
+          "nonce": "9e6dfada256c",
+          "version": "1.0",
+          "realm": "yaak.app"
+        }
+      },
+      {
+        "model": "http_request",
+        "id": "GENERATE_ID::HTTP_REQUEST_13",
+        "workspaceId": "GENERATE_ID::WORKSPACE_0",
+        "folderId": "GENERATE_ID::FOLDER_0",
+        "name": "Folder Child Inherit",
+        "method": "GET",
+        "url": "https://yaak.app/x/echo",
+        "urlParameters": [],
+        "body": {},
+        "bodyType": null,
+        "sortPriority": 14,
+        "headers": [],
+        "authenticationType": null,
+        "authentication": {}
+      },
+      {
+        "model": "http_request",
+        "id": "GENERATE_ID::HTTP_REQUEST_14",
+        "workspaceId": "GENERATE_ID::WORKSPACE_0",
+        "folderId": "GENERATE_ID::FOLDER_0",
+        "name": "Folder Child No Auth",
+        "method": "GET",
+        "url": "https://yaak.app/x/echo",
+        "urlParameters": [],
+        "body": {},
+        "bodyType": null,
+        "sortPriority": 15,
+        "headers": [],
+        "authenticationType": "none",
+        "authentication": {}
+      }
+    ],
+    "folders": [
+      {
+        "model": "folder",
+        "sortPriority": 13,
+        "workspaceId": "GENERATE_ID::WORKSPACE_0",
+        "id": "GENERATE_ID::FOLDER_0",
+        "name": "Folder With Auth",
+        "folderId": null,
+        "authenticationType": "bearer",
+        "authentication": {
+          "token": "folder-token"
+        }
+      }
+    ]
+  },
+  "sourceKeys": {
+    "GENERATE_ID::WORKSPACE_0": "collection:9e6dfada-256c-49ea-a38f-7d1b05b7ca2d"
+  }
+}

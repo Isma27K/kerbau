@@ -1,0 +1,11 @@
+{
+  "name": "@yaak/template-function-request",
+  "displayName": "Request Template Functions",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Template functions for extracting value from requests",
+  "scripts": {
+    "build": "yaakcli build",
+    "dev": "yaakcli dev"
+  }
+}

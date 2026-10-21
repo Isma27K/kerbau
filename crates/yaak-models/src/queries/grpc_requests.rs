@@ -1,0 +1,150 @@
+use super::{conflict_free_name, merge_headers};
+use crate::client_db::{ClientDb, WriteDb};
+use crate::error::Result;
+use crate::models::{
+    AnyModel, Folder, FolderIden, GrpcRequest, GrpcRequestIden, HttpRequestHeader,
+    ResolvedHttpRequestSettings, ResolvedSetting,
+};
+use crate::util::UpdateSource;
+use serde_json::Value;
+use std::collections::BTreeMap;
+
+impl<'a> ClientDb<'a> {
+    pub fn get_grpc_request(&self, id: &str) -> Result<GrpcRequest> {
+        self.find_one(GrpcRequestIden::Id, id)
+    }
+
+    pub fn list_grpc_requests(&self, workspace_id: &str) -> Result<Vec<GrpcRequest>> {
+        self.find_many(GrpcRequestIden::WorkspaceId, workspace_id, None)
+    }
+
+    pub fn list_grpc_requests_for_folder_recursive(
+        &self,
+        folder_id: &str,
+    ) -> Result<Vec<GrpcRequest>> {
+        let mut children = Vec::new();
+        for folder in self.find_many::<Folder>(FolderIden::FolderId, folder_id, None)? {
+            children.extend(self.list_grpc_requests_for_folder_recursive(&folder.id)?);
+        }
+        for request in self.find_many::<GrpcRequest>(GrpcRequestIden::FolderId, folder_id, None)? {
+            children.push(request);
+        }
+        Ok(children)
+    }
+
+    pub fn resolve_auth_for_grpc_request(
+        &self,
+        grpc_request: &GrpcRequest,
+    ) -> Result<(Option<String>, BTreeMap<String, Value>, String)> {
+        if let Some(at) = grpc_request.authentication_type.clone() {
+            return Ok((Some(at), grpc_request.authentication.clone(), grpc_request.id.clone()));
+        }
+
+        if let Some(folder_id) = grpc_request.folder_id.clone() {
+            let folder = self.get_folder(&folder_id)?;
+            return self.resolve_auth_for_folder(&folder);
+        }
+
+        let workspace = self.get_workspace(&grpc_request.workspace_id)?;
+        Ok(self.resolve_auth_for_workspace(&workspace))
+    }
+
+    pub fn resolve_metadata_for_grpc_request(
+        &self,
+        grpc_request: &GrpcRequest,
+    ) -> Result<Vec<HttpRequestHeader>> {
+        // Resolved headers should be from furthest to closest ancestor, to override logically.
+        let mut metadata = Vec::new();
+
+        if let Some(folder_id) = grpc_request.folder_id.clone() {
+            let parent_folder = self.get_folder(&folder_id)?;
+            let mut folder_headers = self.resolve_headers_for_folder(&parent_folder)?;
+            metadata.append(&mut folder_headers);
+        } else {
+            let workspace = self.get_workspace(&grpc_request.workspace_id)?;
+            let mut workspace_metadata = self.resolve_headers_for_workspace(&workspace);
+            metadata.append(&mut workspace_metadata);
+        }
+
+        Ok(merge_headers(metadata, grpc_request.metadata.clone()))
+    }
+
+    pub fn resolve_settings_for_grpc_request(
+        &self,
+        grpc_request: &GrpcRequest,
+    ) -> Result<ResolvedHttpRequestSettings> {
+        let parent = if let Some(folder_id) = grpc_request.folder_id.clone() {
+            let folder = self.get_folder(&folder_id)?;
+            self.resolve_settings_for_folder(&folder)?
+        } else {
+            let workspace = self.get_workspace(&grpc_request.workspace_id)?;
+            self.resolve_settings_for_workspace(&workspace)
+        };
+
+        Ok(ResolvedHttpRequestSettings {
+            validate_certificates: if grpc_request.setting_validate_certificates.enabled {
+                ResolvedSetting::from_model(
+                    grpc_request.setting_validate_certificates.value,
+                    AnyModel::GrpcRequest(grpc_request.clone()),
+                )
+            } else {
+                parent.validate_certificates
+            },
+            request_message_size: if grpc_request.setting_request_message_size.enabled {
+                ResolvedSetting::from_model(
+                    grpc_request.setting_request_message_size.value,
+                    AnyModel::GrpcRequest(grpc_request.clone()),
+                )
+            } else {
+                parent.request_message_size
+            },
+            ..parent
+        })
+    }
+}
+
+impl<'a> WriteDb<'a> {
+    pub fn delete_grpc_request(
+        &self,
+        m: &GrpcRequest,
+        source: &UpdateSource,
+    ) -> Result<GrpcRequest> {
+        self.delete_all_grpc_connections_for_request(m.id.as_str(), source)?;
+        self.delete(m, source)
+    }
+
+    pub fn delete_grpc_request_by_id(
+        &self,
+        id: &str,
+        source: &UpdateSource,
+    ) -> Result<GrpcRequest> {
+        let request = self.get_grpc_request(id)?;
+        self.delete_grpc_request(&request, source)
+    }
+
+    pub fn duplicate_grpc_request(
+        &self,
+        grpc_request: &GrpcRequest,
+        source: &UpdateSource,
+    ) -> Result<GrpcRequest> {
+        let mut request = grpc_request.clone();
+        request.id = "".to_string();
+        request.sort_priority = request.sort_priority + 0.001;
+        let sibling_names = self
+            .list_grpc_requests(&request.workspace_id)?
+            .into_iter()
+            .filter(|m| m.folder_id == request.folder_id)
+            .map(|m| m.name)
+            .collect::<Vec<_>>();
+        request.name = conflict_free_name(&request.name, &sibling_names);
+        self.upsert(&request, source)
+    }
+
+    pub fn upsert_grpc_request(
+        &self,
+        grpc_request: &GrpcRequest,
+        source: &UpdateSource,
+    ) -> Result<GrpcRequest> {
+        self.upsert(grpc_request, source)
+    }
+}

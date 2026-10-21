@@ -1,0 +1,13 @@
+{
+  "name": "@yaak/importer-postman",
+  "displayName": "Postman Importer",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Import collections from Postman",
+  "main": "./build/index.js",
+  "scripts": {
+    "build": "yaakcli build",
+    "dev": "yaakcli dev",
+    "test": "vp test --run tests"
+  }
+}

@@ -1,0 +1,201 @@
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { describe, expect, test } from "vite-plus/test";
+import { convertPostman } from "../src";
+
+describe("importer-postman", () => {
+  const p = path.join(__dirname, "fixtures");
+  const fixtures = fs.readdirSync(p);
+
+  for (const fixture of fixtures) {
+    if (fixture.includes(".output")) {
+      continue;
+    }
+
+    test(`Imports ${fixture}`, () => {
+      const contents = fs.readFileSync(path.join(p, fixture), "utf-8");
+      const expected = fs.readFileSync(path.join(p, fixture.replace(".input", ".output")), "utf-8");
+      const result = convertPostman(contents);
+      // console.log(JSON.stringify(result, null, 2))
+      expect(JSON.stringify(result, null, 2)).toEqual(
+        JSON.stringify(JSON.parse(expected), null, 2),
+      );
+    });
+  }
+
+  test("Imports object descriptions without [object Object]", () => {
+    const result = convertPostman(
+      JSON.stringify({
+        info: {
+          name: "Description Test",
+          schema: "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+        },
+        item: [
+          {
+            name: "Request 1",
+            request: {
+              method: "GET",
+              description: {
+                content: "Lijst van klanten",
+                type: "text/plain",
+              },
+            },
+          },
+        ],
+      }),
+    );
+
+    expect(result?.resources.workspaces).toEqual([
+      expect.objectContaining({
+        name: "Description Test",
+      }),
+    ]);
+    expect(result?.resources.httpRequests).toEqual([
+      expect.objectContaining({
+        name: "Request 1",
+        description: "Lijst van klanten",
+      }),
+    ]);
+  });
+
+  test("Imports url.path when it is a string instead of an array", () => {
+    const result = convertPostman(
+      JSON.stringify({
+        info: {
+          name: "String Path Test",
+          schema: "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+        },
+        item: [
+          {
+            name: "String Path",
+            request: {
+              method: "GET",
+              url: {
+                host: ["example", "com"],
+                path: "foo/bar",
+              },
+            },
+          },
+        ],
+      }),
+    );
+
+    expect(result?.resources.httpRequests).toEqual([
+      expect.objectContaining({
+        name: "String Path",
+        url: "example.com/foo/bar",
+      }),
+    ]);
+  });
+
+  test("Keys items by their Postman ID, unchanged by a rename", () => {
+    const collection = (requestName: string) =>
+      JSON.stringify({
+        info: {
+          _postman_id: "collection-id",
+          name: "Keys",
+          schema: "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+        },
+        item: [
+          {
+            id: "folder-id",
+            name: "Folder",
+            item: [
+              {
+                id: "request-id",
+                name: requestName,
+                request: { method: "GET", url: "https://yaak.app" },
+              },
+            ],
+          },
+        ],
+      });
+
+    const before = convertPostman(collection("Original"));
+    const after = convertPostman(collection("Renamed"));
+
+    const keyOf = (result: ReturnType<typeof convertPostman>, id: string | undefined) =>
+      id == null ? undefined : result?.sourceKeys?.[id];
+
+    expect(keyOf(before, before?.resources.httpRequests[0]?.id)).toBe("item:request-id");
+    expect(keyOf(after, after?.resources.httpRequests[0]?.id)).toBe("item:request-id");
+    expect(keyOf(before, before?.resources.folders[0]?.id)).toBe("item:folder-id");
+    expect(keyOf(before, before?.resources.workspaces[0]?.id)).toBe("collection:collection-id");
+  });
+
+  test("Falls back to the default OAuth 1 signature method for unrecognized ones", () => {
+    const result = convertPostman(
+      JSON.stringify({
+        info: {
+          name: "OAuth 1 Signature",
+          schema: "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+        },
+        item: [
+          {
+            name: "Request",
+            request: {
+              method: "GET",
+              url: "https://yaak.app",
+              auth: {
+                type: "oauth1",
+                oauth1: [{ key: "signatureMethod", value: "HMAC-SHA384" }],
+              },
+            },
+          },
+        ],
+      }),
+    );
+
+    expect(result?.resources.httpRequests).toEqual([
+      expect.objectContaining({
+        authenticationType: "oauth1",
+        authentication: { signatureMethod: "HMAC-SHA1" },
+      }),
+    ]);
+  });
+
+  test("Leaves {{constructor}} alone instead of reaching Object.prototype", () => {
+    const result = convertPostman(
+      JSON.stringify({
+        info: {
+          name: "Prototype Key",
+          schema: "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+        },
+        item: [
+          {
+            name: "Request",
+            request: {
+              method: "GET",
+              url: "https://yaak.app",
+              header: [
+                { key: "X-A", value: "{{constructor}}" },
+                { key: "X-B", value: "{{toString}}" },
+              ],
+            },
+          },
+        ],
+      }),
+    );
+
+    expect(result?.resources.httpRequests[0]?.headers).toEqual([
+      { name: "X-A", value: "${[constructor]}", enabled: true },
+      { name: "X-B", value: "${[toString]}", enabled: true },
+    ]);
+  });
+
+  test("Omits keys for items the collection never identified", () => {
+    const result = convertPostman(
+      JSON.stringify({
+        info: {
+          name: "No IDs",
+          schema: "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+        },
+        item: [{ name: "Request", request: { method: "GET", url: "https://yaak.app" } }],
+      }),
+    );
+
+    const requestId = result?.resources.httpRequests[0]?.id;
+    expect(requestId).toBeDefined();
+    expect(result?.sourceKeys).not.toHaveProperty(requestId as string);
+  });
+});

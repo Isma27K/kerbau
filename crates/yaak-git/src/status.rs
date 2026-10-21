@@ -1,0 +1,375 @@
+use crate::repository::open_repo;
+use crate::util::{local_branch_names, remote_branch_names};
+use log::warn;
+use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::Path;
+use ts_rs::TS;
+use yaak_sync::models::SyncModel;
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "gen_git.ts")]
+pub struct GitStatusSummary {
+    pub path: String,
+    /// The status directory relative to the repo root ("" when it IS the root).
+    /// Useful for displaying entry paths relative to the sync directory
+    pub rela_dir: String,
+    pub head_ref: Option<String>,
+    pub head_ref_shorthand: Option<String>,
+    pub entries: Vec<GitStatusEntry>,
+    pub origins: Vec<String>,
+    pub local_branches: Vec<String>,
+    pub remote_branches: Vec<String>,
+    pub ahead: u32,
+    pub behind: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "gen_git.ts")]
+pub struct GitBranchInfo {
+    pub path: String,
+    pub head_ref: Option<String>,
+    pub head_ref_shorthand: Option<String>,
+    pub origins: Vec<String>,
+    pub local_branches: Vec<String>,
+    pub remote_branches: Vec<String>,
+    pub ahead: u32,
+    pub behind: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "gen_git.ts")]
+pub struct GitStatusEntry {
+    pub rela_path: String,
+    pub status: GitStatus,
+    pub staged: bool,
+    pub prev: Option<SyncModel>,
+    pub next: Option<SyncModel>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "gen_git.ts")]
+pub struct GitWorktreeStatus {
+    pub entries: Vec<GitWorktreeStatusEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "gen_git.ts")]
+pub struct GitWorktreeStatusEntry {
+    pub rela_path: String,
+    pub model_id: Option<String>,
+    pub status: GitStatus,
+    pub staged: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "gen_git.ts")]
+pub enum GitStatus {
+    Untracked,
+    Conflict,
+    Current,
+    Modified,
+    Removed,
+    Renamed,
+    TypeChange,
+}
+
+pub fn git_worktree_status(dir: &Path) -> crate::error::Result<GitWorktreeStatus> {
+    let repo = open_repo(dir)?;
+    let mut opts = scoped_status_options(&repo, dir);
+    opts.include_unmodified(false);
+
+    let mut entries = Vec::new();
+    for entry in repo.statuses(Some(&mut opts))?.into_iter() {
+        let Ok(rela_path) = entry.path() else {
+            continue;
+        };
+        let Some((status, staged)) = git_status_from_raw(entry.status()) else {
+            continue;
+        };
+
+        entries.push(GitWorktreeStatusEntry {
+            rela_path: rela_path.to_string(),
+            model_id: model_id_from_rela_path(Path::new(rela_path)),
+            status,
+            staged,
+        });
+    }
+
+    Ok(GitWorktreeStatus { entries })
+}
+
+pub fn git_branch_info(dir: &Path) -> crate::error::Result<GitBranchInfo> {
+    let repo = open_repo(dir)?;
+    git_branch_info_for_repo(&repo, dir)
+}
+
+pub fn git_status(dir: &Path) -> crate::error::Result<GitStatusSummary> {
+    let repo = open_repo(dir)?;
+    let branch_info = git_branch_info_for_repo(&repo, dir)?;
+    let head_tree = repo.head().ok().and_then(|head| head.peel_to_tree().ok());
+
+    let mut opts = scoped_status_options(&repo, dir);
+    opts.include_unmodified(true); // Include unchanged
+
+    // TODO: Support renames
+
+    let mut entries: Vec<GitStatusEntry> = Vec::new();
+    for entry in repo.statuses(Some(&mut opts))?.into_iter() {
+        let rela_path = entry.path().unwrap().to_string();
+        let Some((status, staged)) = git_status_from_raw(entry.status()) else {
+            continue;
+        };
+
+        // Get previous content from Git, if it's in there
+        let prev = match head_tree.clone() {
+            None => None,
+            Some(t) => match t.get_path(&Path::new(&rela_path)) {
+                Ok(entry) => {
+                    let obj = entry.to_object(&repo)?;
+                    let content = obj.as_blob().unwrap().content();
+                    let name = Path::new(entry.name().unwrap_or_default());
+                    SyncModel::from_bytes(content.into(), name).ok().flatten().map(|m| m.0)
+                }
+                Err(_) => None,
+            },
+        };
+
+        let next = {
+            let full_path = repo.workdir().unwrap().join(rela_path.clone());
+            SyncModel::from_file(full_path.as_path()).ok().flatten().map(|m| m.0)
+        };
+
+        entries.push(GitStatusEntry {
+            status,
+            staged,
+            rela_path,
+            prev: prev.clone(),
+            next: next.clone(),
+        })
+    }
+
+    Ok(GitStatusSummary {
+        entries,
+        rela_dir: repo_relative_dir(&repo, dir).unwrap_or_default(),
+        path: branch_info.path,
+        head_ref: branch_info.head_ref,
+        head_ref_shorthand: branch_info.head_ref_shorthand,
+        origins: branch_info.origins,
+        local_branches: branch_info.local_branches,
+        remote_branches: branch_info.remote_branches,
+        ahead: branch_info.ahead,
+        behind: branch_info.behind,
+    })
+}
+
+fn git_branch_info_for_repo(
+    repo: &git2::Repository,
+    dir: &Path,
+) -> crate::error::Result<GitBranchInfo> {
+    let (head_ref, head_ref_shorthand) = git_head_refs(repo);
+    let origins = repo.remotes()?.into_iter().filter_map(|o| Some(o.ok()??.to_string())).collect();
+    let local_branches = local_branch_names(repo)?;
+    let remote_branches = remote_branch_names(repo)?;
+
+    // Compute ahead/behind relative to remote tracking branch
+    let (ahead, behind) = (|| -> Option<(usize, usize)> {
+        let head = repo.head().ok()?;
+        let local_oid = head.target()?;
+        let branch_name = head.shorthand().ok()?;
+        let upstream_ref =
+            repo.find_branch(&format!("origin/{branch_name}"), git2::BranchType::Remote).ok()?;
+        let upstream_oid = upstream_ref.get().target()?;
+        repo.graph_ahead_behind(local_oid, upstream_oid).ok()
+    })()
+    .unwrap_or((0, 0));
+
+    Ok(GitBranchInfo {
+        path: dir.to_string_lossy().to_string(),
+        head_ref,
+        head_ref_shorthand,
+        origins,
+        local_branches,
+        remote_branches,
+        ahead: ahead as u32,
+        behind: behind as u32,
+    })
+}
+
+fn git_head_refs(repo: &git2::Repository) -> (Option<String>, Option<String>) {
+    match repo.head() {
+        Ok(head) => {
+            let head_ref = head.name().ok().map(|s| s.to_string());
+            let head_ref_shorthand = head.shorthand().ok().map(|s| s.to_string());
+            (head_ref, head_ref_shorthand)
+        }
+        Err(_) => {
+            // For "unborn" repos, reading from HEAD is the only way to get the branch name
+            // See https://github.com/starship/starship/pull/1336
+            let head_path = repo.path().join("HEAD");
+            let head_ref = fs::read_to_string(&head_path)
+                .ok()
+                .unwrap_or_default()
+                .lines()
+                .next()
+                .map(|s| s.trim_start_matches("ref:").trim().to_string());
+            let head_ref_shorthand =
+                head_ref.clone().map(|r| r.split('/').last().unwrap_or("unknown").to_string());
+            (head_ref, head_ref_shorthand)
+        }
+    }
+}
+
+fn git_status_from_raw(status: git2::Status) -> Option<(GitStatus, bool)> {
+    let index_status = match status {
+        // Note: order matters here, since we're checking a bitmap!
+        s if s.contains(git2::Status::CONFLICTED) => GitStatus::Conflict,
+        s if s.contains(git2::Status::INDEX_NEW) => GitStatus::Untracked,
+        s if s.contains(git2::Status::INDEX_MODIFIED) => GitStatus::Modified,
+        s if s.contains(git2::Status::INDEX_DELETED) => GitStatus::Removed,
+        s if s.contains(git2::Status::INDEX_RENAMED) => GitStatus::Renamed,
+        s if s.contains(git2::Status::INDEX_TYPECHANGE) => GitStatus::TypeChange,
+        s if s.contains(git2::Status::CURRENT) => GitStatus::Current,
+        s => {
+            warn!("Unknown index status {s:?}");
+            return None;
+        }
+    };
+
+    let worktree_status = match status {
+        // Note: order matters here, since we're checking a bitmap!
+        s if s.contains(git2::Status::CONFLICTED) => GitStatus::Conflict,
+        s if s.contains(git2::Status::WT_NEW) => GitStatus::Untracked,
+        s if s.contains(git2::Status::WT_MODIFIED) => GitStatus::Modified,
+        s if s.contains(git2::Status::WT_DELETED) => GitStatus::Removed,
+        s if s.contains(git2::Status::WT_RENAMED) => GitStatus::Renamed,
+        s if s.contains(git2::Status::WT_TYPECHANGE) => GitStatus::TypeChange,
+        s if s.contains(git2::Status::CURRENT) => GitStatus::Current,
+        s => {
+            warn!("Unknown worktree status {s:?}");
+            return None;
+        }
+    };
+
+    let status =
+        if index_status == GitStatus::Current { worktree_status } else { index_status.clone() };
+    let staged = index_status != GitStatus::Current;
+
+    Some((status, staged))
+}
+
+/// Construct StatusOptions for a walk scoped to `dir`. Yaak only cares about
+/// the sync directory, and a full walk is expensive when the containing repo
+/// is large (e.g. a sync dir inside a monorepo); scoping is a no-op when
+/// `dir` is the repo root. Always build status walks through this so a new
+/// call site can't forget the scoping.
+pub(crate) fn scoped_status_options(repo: &git2::Repository, dir: &Path) -> git2::StatusOptions {
+    let mut opts = git2::StatusOptions::new();
+    opts.include_ignored(false).include_untracked(true).recurse_untracked_dirs(true);
+    if let Some(rela) = repo_relative_dir(repo, dir) {
+        opts.pathspec(rela);
+        // Match the path literally (exact or directory prefix) instead of as
+        // a glob — directory names can contain pattern characters like [ or *
+        opts.disable_pathspec_match(true);
+    }
+    opts
+}
+
+/// The path of `dir` relative to the repo root as a forward-slash string
+/// (Git pathspecs use forward slashes even on Windows), or None when `dir`
+/// is the root itself (or outside the repo). Both sides are canonicalized so
+/// symlinked paths compare consistently.
+pub(crate) fn repo_relative_dir(repo: &git2::Repository, dir: &Path) -> Option<String> {
+    let workdir = repo.workdir()?;
+    let workdir = workdir.canonicalize().unwrap_or_else(|_| workdir.to_path_buf());
+    let canonical_dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let rela = canonical_dir.strip_prefix(&workdir).ok()?;
+    if rela.as_os_str().is_empty() {
+        return None;
+    }
+    let parts: Vec<String> =
+        rela.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
+    Some(parts.join("/"))
+}
+
+fn model_id_from_rela_path(path: &Path) -> Option<String> {
+    let ext = path.extension()?.to_str()?;
+    if ext != "yaml" && ext != "yml" && ext != "json" {
+        return None;
+    }
+
+    path.file_stem()?.to_str()?.strip_prefix("yaak.").map(String::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_worktree_status_scoped_to_subdir() {
+        let tmp = tempfile::tempdir().unwrap();
+        git2::Repository::init(tmp.path()).unwrap();
+
+        let sync_dir = tmp.path().join("sync");
+        std::fs::create_dir(&sync_dir).unwrap();
+        std::fs::write(sync_dir.join("yaak.req_1.yaml"), "inside").unwrap();
+        std::fs::write(tmp.path().join("outside.txt"), "outside").unwrap();
+
+        // Status on a subdirectory only reports that subdirectory
+        let status = git_worktree_status(&sync_dir).unwrap();
+        let paths: Vec<&str> = status.entries.iter().map(|e| e.rela_path.as_str()).collect();
+        assert_eq!(paths, vec!["sync/yaak.req_1.yaml"]);
+        assert_eq!(status.entries[0].model_id.as_deref(), Some("req_1"));
+
+        // Status on the repo root reports everything
+        let status = git_worktree_status(tmp.path()).unwrap();
+        assert_eq!(status.entries.len(), 2);
+    }
+
+    #[test]
+    fn test_worktree_status_scoped_literal_dir_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        git2::Repository::init(tmp.path()).unwrap();
+
+        // A directory name that is also a valid glob pattern ([1] matches "1")
+        let sync_dir = tmp.path().join("sync[1]");
+        std::fs::create_dir(&sync_dir).unwrap();
+        std::fs::write(sync_dir.join("yaak.req_1.yaml"), "inside").unwrap();
+        std::fs::create_dir(tmp.path().join("sync1")).unwrap();
+        std::fs::write(tmp.path().join("sync1").join("decoy.txt"), "glob match").unwrap();
+
+        let status = git_worktree_status(&sync_dir).unwrap();
+        let paths: Vec<&str> = status.entries.iter().map(|e| e.rela_path.as_str()).collect();
+        assert_eq!(paths, vec!["sync[1]/yaak.req_1.yaml"]);
+    }
+
+    #[test]
+    fn test_status_scoped_to_subdir() {
+        let tmp = tempfile::tempdir().unwrap();
+        git2::Repository::init(tmp.path()).unwrap();
+
+        let sync_dir = tmp.path().join("sync");
+        std::fs::create_dir(&sync_dir).unwrap();
+        std::fs::write(sync_dir.join("yaak.req_1.yaml"), "inside").unwrap();
+        std::fs::write(sync_dir.join("README.md"), "external, but in sync dir").unwrap();
+        std::fs::write(tmp.path().join("outside.txt"), "outside").unwrap();
+
+        // The commit dialog's status only reports the sync directory
+        let status = git_status(&sync_dir).unwrap();
+        assert_eq!(status.rela_dir, "sync");
+        let mut paths: Vec<&str> = status.entries.iter().map(|e| e.rela_path.as_str()).collect();
+        paths.sort();
+        assert_eq!(paths, vec!["sync/README.md", "sync/yaak.req_1.yaml"]);
+
+        // Status on the repo root reports everything
+        let status = git_status(tmp.path()).unwrap();
+        assert_eq!(status.rela_dir, "");
+        assert_eq!(status.entries.len(), 3);
+    }
+}

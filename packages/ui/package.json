@@ -1,0 +1,18 @@
+{
+  "name": "@yaakapp-internal/ui",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./editor": "./src/editor.ts"
+  },
+  "sideEffects": [
+    "*.css"
+  ],
+  "dependencies": {
+    "jotai-family": "^1.0.1"
+  }
+}

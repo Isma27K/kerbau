@@ -1,0 +1,9 @@
+{
+  "printWidth": 100,
+  "ignorePatterns": [
+    "**/bindings/**",
+    "crates/yaak-templates/pkg/**",
+    "apps/yaak-client/routeTree.gen.ts",
+    "plugins/importer-bruno/tests/fixtures/upstream/**"
+  ]
+}

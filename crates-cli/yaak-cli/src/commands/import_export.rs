@@ -1,0 +1,264 @@
+use crate::cli::{ExportArgs, ImportArgs};
+use crate::context::CliContext;
+use crate::utils::workspace::resolve_workspace_id;
+use std::fs;
+use yaak::import;
+use yaak_models::export::{self, ExportDataParams};
+use yaak_models::util::{
+    BatchUpsertResult, ImportDestination, ImportOrigin, ImportPlanAction, ImportPlanItem,
+};
+use yaak_plugins::events::{ImportRequest, ImportResources, PluginContext};
+
+type CommandResult<T = ()> = std::result::Result<T, String>;
+
+pub async fn run_import(ctx: &CliContext, args: ImportArgs) -> i32 {
+    match import(ctx, args).await {
+        Ok((result, items)) => {
+            println!("Imported {}", format_counts(&result));
+            if let Some(skipped) = format_skipped(&items) {
+                println!("Skipped {skipped}");
+            }
+            0
+        }
+        Err(error) => {
+            eprintln!("Error: {error}");
+            1
+        }
+    }
+}
+
+pub fn run_export(ctx: &CliContext, args: ExportArgs) -> i32 {
+    match export(ctx, args) {
+        Ok(count) => {
+            println!("Exported {count} workspace(s)");
+            0
+        }
+        Err(error) => {
+            eprintln!("Error: {error}");
+            1
+        }
+    }
+}
+
+async fn import(
+    ctx: &CliContext,
+    args: ImportArgs,
+) -> CommandResult<(BatchUpsertResult, Vec<ImportPlanItem>)> {
+    if let Some(workspace_id) = args.workspace_id.as_deref() {
+        ctx.db()
+            .get_workspace(workspace_id)
+            .map_err(|e| format!("Failed to get workspace '{workspace_id}': {e}"))?;
+    }
+
+    let input = ImportRequest::from_path(&args.file)
+        .map_err(|err| format!("Unable to read import source {}: {err}", args.file.display()))?;
+    let plugin_context = PluginContext::new(None, args.workspace_id.clone());
+    let plugin_manager = ctx.plugin_manager();
+    let import_result = plugin_manager
+        .import_input(&plugin_context, &input)
+        .await
+        .map_err(|e| format!("Failed to import data: {e}"))?;
+    let importer = import_result.importer;
+    let resources = import_result.resources;
+    let workspace_id = args.workspace_id;
+    if workspace_id.is_none() && resources_need_current_workspace(&resources) {
+        return Err(
+            "This import requires a workspace context. Provide --workspace-id <WORKSPACE_ID>."
+                .to_string(),
+        );
+    }
+    let destination = match workspace_id {
+        Some(workspace_id) => {
+            ImportDestination::ExistingWorkspace { workspace_id, folder_id: None }
+        }
+        None => ImportDestination::NewWorkspace,
+    };
+    let plan = import::plan_import_resources(
+        ctx.query_manager(),
+        importer,
+        destination,
+        resources,
+        import_result.source_keys,
+        Some(file_origin(&args.file)),
+    )
+    .map_err(|e| format!("Failed to plan import: {e}"))?;
+    let items = plan.items.clone();
+    let imported = import::commit_import_plan(ctx.query_manager(), plan)
+        .map_err(|e| format!("Failed to import data: {e}"))?;
+    Ok((imported, items))
+}
+
+fn file_origin(path: &std::path::Path) -> ImportOrigin {
+    let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let label = canonical
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.display().to_string());
+    ImportOrigin { origin: canonical.to_string_lossy().to_string(), label }
+}
+
+/// Summarize what the default selection left untouched during a merging re-import.
+fn format_skipped(items: &[ImportPlanItem]) -> Option<String> {
+    let count = |action: ImportPlanAction| items.iter().filter(|i| i.action == action).count();
+    let plural = |n: usize| if n == 1 { "" } else { "s" };
+
+    let mut parts = Vec::new();
+    let deletions = count(ImportPlanAction::Delete);
+    if deletions > 0 {
+        parts.push(format!("{deletions} removed from source (not deleted locally)"));
+    }
+    let conflicts = count(ImportPlanAction::Conflict);
+    if conflicts > 0 {
+        parts.push(format!("{conflicts} conflict{} (kept local changes)", plural(conflicts)));
+    }
+    let keep_local = count(ImportPlanAction::KeepLocal);
+    if keep_local > 0 {
+        parts.push(format!("{keep_local} with local edits"));
+    }
+    let ignored = count(ImportPlanAction::Ignored);
+    if ignored > 0 {
+        parts.push(format!("{ignored} ignored"));
+    }
+    let unchanged = count(ImportPlanAction::Unchanged);
+    if unchanged > 0 {
+        parts.push(format!("{unchanged} unchanged"));
+    }
+
+    if parts.is_empty() { None } else { Some(parts.join(", ")) }
+}
+
+/// Write a file so that afterwards it is either the old one or the whole new one.
+///
+/// Writing in place would truncate the previous export before the new one existed, so an
+/// interrupted run loses both. Instead the bytes go to a neighbouring file, are flushed, and
+/// take the target's name in one step. The directory is flushed too: `sync_all` on a file
+/// promises its contents, not that the name it just gained will survive a power cut.
+fn write_durably(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let dir = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => std::path::Path::new("."),
+    };
+    // Alongside the target, because a rename is only atomic within one filesystem.
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".tmp{}", std::process::id()));
+    let tmp = dir.join(name);
+
+    let write = |tmp: &std::path::Path| -> std::io::Result<()> {
+        let mut file = std::fs::File::create(tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()
+    };
+    if let Err(e) = write(&tmp) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+
+    // Only Unix lets a directory be opened for this. Elsewhere the rename is as much as
+    // the platform offers, and the file itself is already flushed.
+    #[cfg(unix)]
+    std::fs::File::open(dir)?.sync_all()?;
+
+    Ok(())
+}
+
+fn export(ctx: &CliContext, args: ExportArgs) -> CommandResult<usize> {
+    let workspace_ids = resolve_export_workspace_ids(ctx, args.workspace_ids, args.all)?;
+    let workspace_id_refs: Vec<&str> = workspace_ids.iter().map(String::as_str).collect();
+    let document = export::export_data(ExportDataParams {
+        query_manager: ctx.query_manager(),
+        yaak_version: env!("CARGO_PKG_VERSION"),
+        workspace_ids: workspace_id_refs,
+        include_private_environments: args.include_private_environments,
+    })
+    .map_err(|e| format!("Failed to export data: {e}"))?;
+    // Flushed before reporting success: an export is a backup, and a backup that the
+    // command called done while it was still only in the page cache is the one case
+    // where saying nothing went wrong is worst.
+    write_durably(&args.file, document.as_bytes())
+        .map_err(|e| format!("Failed to write {}: {e}", args.file.display()))?;
+
+    Ok(workspace_ids.len())
+}
+
+fn resolve_export_workspace_ids(
+    ctx: &CliContext,
+    workspace_ids: Vec<String>,
+    all: bool,
+) -> CommandResult<Vec<String>> {
+    if all {
+        let workspaces =
+            ctx.db().list_workspaces().map_err(|e| format!("Failed to list workspaces: {e}"))?;
+        if workspaces.is_empty() {
+            return Err("No workspaces found to export".to_string());
+        }
+        return Ok(workspaces.into_iter().map(|w| w.id).collect());
+    }
+
+    if workspace_ids.is_empty() {
+        return resolve_workspace_id(ctx, None, "export").map(|id| vec![id]);
+    }
+
+    for workspace_id in &workspace_ids {
+        ctx.db()
+            .get_workspace(workspace_id)
+            .map_err(|e| format!("Failed to get workspace '{workspace_id}': {e}"))?;
+    }
+    Ok(workspace_ids)
+}
+
+fn resources_need_current_workspace(resources: &ImportResources) -> bool {
+    resources.workspaces.iter().any(|w| w.id == "CURRENT_WORKSPACE")
+        || resources.environments.iter().any(|e| {
+            e.workspace_id == "CURRENT_WORKSPACE"
+                || e.parent_id.as_deref() == Some("CURRENT_WORKSPACE")
+        })
+        || resources.folders.iter().any(|f| {
+            f.workspace_id == "CURRENT_WORKSPACE"
+                || f.folder_id.as_deref() == Some("CURRENT_WORKSPACE")
+        })
+        || resources.http_requests.iter().any(|r| {
+            r.workspace_id == "CURRENT_WORKSPACE"
+                || r.folder_id.as_deref() == Some("CURRENT_WORKSPACE")
+        })
+        || resources.grpc_requests.iter().any(|r| {
+            r.workspace_id == "CURRENT_WORKSPACE"
+                || r.folder_id.as_deref() == Some("CURRENT_WORKSPACE")
+        })
+        || resources.websocket_requests.iter().any(|r| {
+            r.workspace_id == "CURRENT_WORKSPACE"
+                || r.folder_id.as_deref() == Some("CURRENT_WORKSPACE")
+        })
+}
+
+fn format_counts(result: &BatchUpsertResult) -> String {
+    let names = [
+        "workspace",
+        "environment",
+        "folder",
+        "HTTP request",
+        "gRPC request",
+        "WebSocket request",
+    ];
+    let counts = [
+        (result.workspaces.len(), names[0]),
+        (result.environments.len(), names[1]),
+        (result.folders.len(), names[2]),
+        (result.http_requests.len(), names[3]),
+        (result.grpc_requests.len(), names[4]),
+        (result.websocket_requests.len(), names[5]),
+    ];
+
+    let non_zero: Vec<String> = counts
+        .into_iter()
+        .filter(|(count, _)| *count > 0)
+        .map(|(count, name)| format!("{count} {name}{}", if count == 1 { "" } else { "s" }))
+        .collect();
+
+    if non_zero.is_empty() { "nothing".to_string() } else { non_zero.join(", ") }
+}

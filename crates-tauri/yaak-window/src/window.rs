@@ -1,0 +1,259 @@
+use crate::window_state;
+use log::info;
+use rand::random;
+use tauri::{AppHandle, Manager, Runtime, WebviewUrl, WebviewWindow, WindowEvent};
+use tokio::sync::mpsc;
+
+const DEFAULT_WINDOW_WIDTH: f64 = 1100.0;
+const DEFAULT_WINDOW_HEIGHT: f64 = 600.0;
+
+const MIN_WINDOW_WIDTH: f64 = 300.0;
+const MIN_WINDOW_HEIGHT: f64 = 300.0;
+
+pub const MAIN_WINDOW_PREFIX: &str = "main_";
+const OTHER_WINDOW_PREFIX: &str = "other_";
+const MAIN_WINDOW_STATE_KEY: &str = "main";
+
+#[derive(Default, Debug)]
+pub struct CreateWindowConfig<'s> {
+    pub url: &'s str,
+    pub label: &'s str,
+    pub title: &'s str,
+    pub state_key: Option<String>,
+    pub inner_size: Option<(f64, f64)>,
+    pub position: Option<(f64, f64)>,
+    pub restore_position: Option<bool>,
+    pub navigation_tx: Option<mpsc::Sender<String>>,
+    pub close_tx: Option<mpsc::Sender<()>>,
+    pub data_dir_key: Option<String>,
+    pub initialization_script: Option<String>,
+    pub hidden: bool,
+    pub hide_titlebar: bool,
+    pub use_native_titlebar: bool,
+}
+
+pub fn create_window<R: Runtime>(
+    handle: &AppHandle<R>,
+    config: CreateWindowConfig,
+) -> tauri::Result<WebviewWindow<R>> {
+    info!("Create new window label={}", config.label);
+    let state_key = config.state_key.clone().unwrap_or_else(|| config.label.to_string());
+    let restore_position = config.restore_position.unwrap_or(true);
+    let mut inner_size = config.inner_size;
+    let mut position = config.position;
+    let mut maximized = false;
+    window_state::apply_saved_state(
+        handle,
+        &state_key,
+        &mut inner_size,
+        &mut position,
+        &mut maximized,
+        restore_position,
+    );
+
+    let mut win_builder =
+        tauri::WebviewWindowBuilder::new(handle, config.label, WebviewUrl::App(config.url.into()))
+            .title(config.title)
+            .resizable(true)
+            .visible(!config.hidden)
+            .fullscreen(false)
+            .maximized(maximized)
+            .min_inner_size(MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT);
+
+    if let Some(script) = config.initialization_script {
+        win_builder = win_builder.initialization_script(script);
+    }
+
+    if let Some(key) = config.data_dir_key {
+        #[cfg(not(target_os = "macos"))]
+        {
+            use std::fs;
+            let safe_key = format!("{:x}", md5::compute(key.as_bytes()));
+            let dir = handle.path().app_data_dir()?.join("window-sessions").join(safe_key);
+            fs::create_dir_all(&dir)?;
+            win_builder = win_builder.data_directory(dir);
+        }
+
+        // macOS doesn't support `data_directory()` so must use this fn instead
+        #[cfg(target_os = "macos")]
+        {
+            let hash = md5::compute(key.as_bytes());
+            let mut id = [0u8; 16];
+            id.copy_from_slice(&hash[..16]); // Take the first 16 bytes of the hash
+            win_builder = win_builder.data_store_identifier(id);
+        }
+    }
+
+    if let Some((w, h)) = inner_size {
+        win_builder = win_builder.inner_size(w, h);
+    } else {
+        win_builder = win_builder.inner_size(600.0, 600.0);
+    }
+
+    if let Some((x, y)) = position {
+        win_builder = win_builder.position(x, y);
+    } else {
+        win_builder = win_builder.center();
+    }
+
+    if let Some(tx) = config.navigation_tx {
+        win_builder = win_builder.on_navigation(move |url| {
+            let url = url.to_string();
+            let tx = tx.clone();
+            tauri::async_runtime::block_on(async move {
+                tx.send(url).await.unwrap();
+            });
+            true
+        });
+    }
+
+    if config.hide_titlebar && !config.use_native_titlebar {
+        #[cfg(target_os = "macos")]
+        {
+            use tauri::TitleBarStyle;
+            win_builder = win_builder.hidden_title(true).title_bar_style(TitleBarStyle::Overlay);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            win_builder = win_builder.decorations(false);
+        }
+    }
+
+    if let Some(w) = handle.webview_windows().get(config.label) {
+        info!("Webview with label {} already exists. Focusing existing", config.label);
+        w.set_focus()?;
+        return Ok(w.to_owned());
+    }
+
+    let win = win_builder.build()?;
+    window_state::track_window(&win, &state_key);
+
+    if let Some(tx) = config.close_tx {
+        win.on_window_event(move |event| match event {
+            WindowEvent::CloseRequested { .. } => {
+                let tx = tx.clone();
+                tauri::async_runtime::spawn(async move {
+                    tx.send(()).await.unwrap();
+                });
+            }
+            _ => {}
+        });
+    }
+
+    Ok(win)
+}
+
+pub fn create_main_window<R: Runtime>(
+    handle: &AppHandle<R>,
+    url: &str,
+    initialization_script: Option<String>,
+    use_native_titlebar: bool,
+) -> tauri::Result<WebviewWindow<R>> {
+    let mut counter = 0;
+    let label = loop {
+        let label = format!("{MAIN_WINDOW_PREFIX}{counter}");
+        match handle.webview_windows().get(label.as_str()) {
+            None => break Some(label),
+            Some(_) => counter += 1,
+        }
+    }
+    .expect("Failed to generate label for new window");
+
+    let config = CreateWindowConfig {
+        url,
+        label: label.as_str(),
+        title: "Yaak",
+        state_key: Some(MAIN_WINDOW_STATE_KEY.to_string()),
+        inner_size: Some((DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT)),
+        position: Some((
+            // Offset by random amount so it's easier to differentiate
+            100.0 + random::<f64>() * 20.0,
+            100.0 + random::<f64>() * 20.0,
+        )),
+        restore_position: Some(counter == 0),
+        initialization_script,
+        hidden: true,
+        hide_titlebar: true,
+        use_native_titlebar,
+        ..Default::default()
+    };
+
+    create_window(handle, config)
+}
+
+pub fn create_child_window<R: Runtime>(
+    parent_window: &WebviewWindow<R>,
+    url: &str,
+    label: &str,
+    title: &str,
+    inner_size: (f64, f64),
+    initialization_script: Option<String>,
+    use_native_titlebar: bool,
+) -> tauri::Result<WebviewWindow<R>> {
+    let app_handle = parent_window.app_handle();
+    let state_key = label.to_string();
+    let label = format!("{OTHER_WINDOW_PREFIX}_{label}");
+    let scale_factor = parent_window.scale_factor()?;
+
+    let current_pos = parent_window.inner_position()?.to_logical::<f64>(scale_factor);
+    let current_size = parent_window.inner_size()?.to_logical::<f64>(scale_factor);
+
+    // Position the new window in the middle of the parent
+    let position = (
+        current_pos.x + current_size.width / 2.0 - inner_size.0 / 2.0,
+        current_pos.y + current_size.height / 2.0 - inner_size.1 / 2.0,
+    );
+
+    let config = CreateWindowConfig {
+        label: label.as_str(),
+        title,
+        state_key: Some(state_key),
+        url,
+        inner_size: Some(inner_size),
+        position: Some(position),
+        initialization_script,
+        hidden: true,
+        hide_titlebar: true,
+        use_native_titlebar,
+        ..Default::default()
+    };
+
+    let child_window = create_window(&app_handle, config)?;
+
+    // NOTE: These listeners will remain active even when the windows close. Unfortunately,
+    //   there's no way to unlisten to events for now, so we just have to be defensive.
+
+    {
+        let parent_window = parent_window.clone();
+        let child_window = child_window.clone();
+        child_window.clone().on_window_event(move |e| match e {
+            // When the new window is destroyed, bring the other up behind it
+            WindowEvent::Destroyed => {
+                if let Some(w) = parent_window.get_webview_window(child_window.label()) {
+                    w.set_focus().unwrap();
+                }
+            }
+            _ => {}
+        });
+    }
+
+    {
+        let parent_window = parent_window.clone();
+        let child_window = child_window.clone();
+        parent_window.clone().on_window_event(move |e| match e {
+            // When the parent window is closed, close the child
+            WindowEvent::CloseRequested { .. } => child_window.close().unwrap(),
+            // When the parent window is focused, bring the child above
+            WindowEvent::Focused(focus) => {
+                if *focus {
+                    if let Some(w) = parent_window.get_webview_window(child_window.label()) {
+                        w.set_focus().unwrap();
+                    };
+                }
+            }
+            _ => {}
+        });
+    }
+
+    Ok(child_window)
+}
